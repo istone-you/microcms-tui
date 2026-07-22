@@ -3,9 +3,10 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct MicroCmsClient {
-    service_id: String,
     api_key: String,
     http: reqwest::Client,
+    content_api_url: String,
+    management_api_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,28 +112,34 @@ impl MicroCmsClient {
             bail!("api_key is missing or empty");
         }
 
+        let content_api_url = api_url_from_env(
+            "MICROCMS_CONTENT_API_URL",
+            &service_id,
+            "https://microcms.io",
+        )?;
+        let management_api_url = api_url_from_env(
+            "MICROCMS_MANAGEMENT_API_URL",
+            &service_id,
+            "https://microcms-management.io",
+        )?;
+
         Ok(Self {
-            service_id,
             api_key,
             http: reqwest::Client::new(),
+            content_api_url,
+            management_api_url,
         })
     }
 
     pub async fn list_apis(&self) -> Result<ApiList> {
-        let url = format!(
-            "https://{}.microcms-management.io/api/v1/apis",
-            self.service_id
-        );
+        let url = format!("{}/api/v1/apis", self.management_api_url);
         let value = self.get(url).await?;
         parse_api_list(value)
     }
 
     pub async fn get_api_schema(&self, endpoint: &str) -> Result<Value> {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
-        let url = format!(
-            "https://{}.microcms-management.io/api/v1/apis/{endpoint}",
-            self.service_id
-        );
+        let url = format!("{}/api/v1/apis/{endpoint}", self.management_api_url);
         let response = self
             .http
             .get(url)
@@ -169,10 +176,7 @@ impl MicroCmsClient {
             bail!("endpoint is missing or empty");
         }
 
-        let url = format!(
-            "https://{}.microcms.io/api/v1/{}",
-            self.service_id, endpoint
-        );
+        let url = format!("{}/api/v1/{endpoint}", self.content_api_url);
         let mut request = self
             .http
             .get(url)
@@ -211,7 +215,7 @@ impl MicroCmsClient {
         status: ContentWriteStatus,
     ) -> Result<()> {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
-        let url = format!("https://{}.microcms.io/api/v1/{endpoint}", self.service_id);
+        let url = format!("{}/api/v1/{endpoint}", self.content_api_url);
         let mut request = self
             .http
             .post(url)
@@ -232,10 +236,7 @@ impl MicroCmsClient {
     ) -> Result<()> {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
         let content_id = normalized_segment(content_id, "content ID")?;
-        let url = format!(
-            "https://{}.microcms.io/api/v1/{endpoint}/{content_id}",
-            self.service_id
-        );
+        let url = format!("{}/api/v1/{endpoint}/{content_id}", self.content_api_url);
         let mut request = self
             .http
             .put(url)
@@ -254,10 +255,7 @@ impl MicroCmsClient {
         offset: usize,
     ) -> Result<ContentMetaList> {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
-        let url = format!(
-            "https://{}.microcms-management.io/api/v1/contents/{endpoint}",
-            self.service_id
-        );
+        let url = format!("{}/api/v1/contents/{endpoint}", self.management_api_url);
         let response = self
             .http
             .get(url)
@@ -292,10 +290,7 @@ impl MicroCmsClient {
     ) -> Result<()> {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
         let content_id = normalized_segment(content_id, "content ID")?;
-        let url = format!(
-            "https://{}.microcms.io/api/v1/{endpoint}/{content_id}",
-            self.service_id
-        );
+        let url = format!("{}/api/v1/{endpoint}/{content_id}", self.content_api_url);
         let mut request = self
             .http
             .patch(url)
@@ -310,10 +305,7 @@ impl MicroCmsClient {
     pub async fn delete_content(&self, endpoint: &str, content_id: &str) -> Result<()> {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
         let content_id = normalized_segment(content_id, "content ID")?;
-        let url = format!(
-            "https://{}.microcms.io/api/v1/{endpoint}/{content_id}",
-            self.service_id
-        );
+        let url = format!("{}/api/v1/{endpoint}/{content_id}", self.content_api_url);
         let request = self
             .http
             .delete(url)
@@ -330,8 +322,8 @@ impl MicroCmsClient {
         let endpoint = normalized_segment(endpoint, "endpoint")?;
         let content_id = normalized_segment(content_id, "content ID")?;
         let url = format!(
-            "https://{}.microcms-management.io/api/v1/contents/{endpoint}/{content_id}/status",
-            self.service_id
+            "{}/api/v1/contents/{endpoint}/{content_id}/status",
+            self.management_api_url
         );
         let request = self
             .http
@@ -399,6 +391,33 @@ fn parse_content_collection(value: Value) -> Result<ContentCollection> {
 
 fn nonempty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.is_empty())
+}
+
+fn api_url_from_env(name: &str, service_id: &str, default: &str) -> Result<String> {
+    let configured = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string());
+    service_api_url(service_id, &configured)
+        .with_context(|| format!("invalid {name} environment variable"))
+}
+
+fn service_api_url(service_id: &str, base_url: &str) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let base_url = if base_url.contains("://") {
+        base_url.to_string()
+    } else {
+        format!("https://{base_url}")
+    };
+    let mut url = reqwest::Url::parse(&base_url).context("API URL is not valid")?;
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        bail!("API URL must not include a path, query, or fragment");
+    }
+    let host = url.host_str().context("API URL host is missing")?;
+    let service_host = format!("{service_id}.{host}");
+    url.set_host(Some(&service_host))
+        .map_err(|_| anyhow::anyhow!("service ID and API host do not form a valid hostname"))?;
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 fn normalized_segment<'a>(value: &'a str, name: &str) -> Result<&'a str> {
@@ -502,6 +521,19 @@ mod tests {
     fn content_write_status_only_adds_query_for_draft() {
         assert_eq!(ContentWriteStatus::Default.query_value(), None);
         assert_eq!(ContentWriteStatus::Draft.query_value(), Some("draft"));
+    }
+
+    #[test]
+    fn api_url_override_keeps_service_id_out_of_environment_value() {
+        assert_eq!(
+            service_api_url("service", "https://microcms-staging.net/").unwrap(),
+            "https://service.microcms-staging.net"
+        );
+        assert_eq!(
+            service_api_url("service", "microcms.io").unwrap(),
+            "https://service.microcms.io"
+        );
+        assert!(service_api_url("service", "https://microcms.io/api/v1").is_err());
     }
 
     #[test]

@@ -31,6 +31,8 @@ microcms-tui --service-id your-service --api-key your-api-key --endpoint blogs -
 
 The TOML config contains optional `service_id`, `api_key`, and `default_endpoint` fields. Credentials can also be supplied with `MICROCMS_SERVICE_ID` and `MICROCMS_API_KEY`. Values are resolved in this order: CLI flags, environment variables, then the config file. `--endpoint` and `default_endpoint` only preselect an API; endpoint selection and switching happen inside the TUI.
 
+For environments with alternate API domains, the shared domains can be overridden with `MICROCMS_CONTENT_API_URL` and `MICROCMS_MANAGEMENT_API_URL`. Do not include the service ID or API path: for example, set `MICROCMS_CONTENT_API_URL=https://microcms-staging.net`. microcms-tui keeps the configured service ID as the subdomain and always appends the fixed `/api/v1` path, producing `https://{service_id}.microcms-staging.net/api/v1/...`. When unset or empty, the normal microCMS domains are used.
+
 Do not commit a config file containing a real API key.
 
 The API key needs Management API access for endpoint discovery and `GET`, `POST`, `PATCH`, and `DELETE` permissions for the target Content API endpoints.
