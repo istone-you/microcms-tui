@@ -251,6 +251,27 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             _ => None,
         };
     }
+    if app.screen == Screen::ContentBrowser && app.content_kind == ContentCollectionKind::Object {
+        return match code {
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Esc | KeyCode::Char('b') => Some(Action::Back),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::PreviewScrollDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::PreviewScrollUp),
+            KeyCode::Char('g') => Some(Action::PreviewScrollTop),
+            KeyCode::Char('G') => Some(Action::PreviewScrollBottom),
+            KeyCode::Char('r') => Some(Action::Reload),
+            KeyCode::Char('/') => Some(Action::EditSearch),
+            KeyCode::Char('f') => Some(Action::EditFilters),
+            KeyCode::Char('o') => Some(Action::EditOrders),
+            KeyCode::Char('l') => Some(Action::EditFields),
+            KeyCode::Char('z') => Some(Action::EditDepth),
+            KeyCode::Char('i') => Some(Action::EditIds),
+            KeyCode::Char('K') => Some(Action::EditDraftKey),
+            KeyCode::Char('m') => Some(Action::EditRichEditorFormat),
+            KeyCode::Char('x') => Some(Action::ClearQuery),
+            _ => None,
+        };
+    }
     if app.preview_fullscreen {
         return match code {
             KeyCode::Char('?') => Some(Action::ToggleHelp),
@@ -1063,6 +1084,41 @@ mod tests {
             action_for_key(key(KeyCode::Enter), &app),
             Some(Action::Select)
         );
+    }
+
+    #[test]
+    fn object_api_uses_direct_preview_keymap_without_fullscreen_toggle() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.content_kind = ContentCollectionKind::Object;
+
+        assert_eq!(action_for_key(key(KeyCode::Enter), &app), None);
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('j')), &app),
+            Some(Action::PreviewScrollDown)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('G')), &app),
+            Some(Action::PreviewScrollBottom)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('r')), &app),
+            Some(Action::Reload)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('l')), &app),
+            Some(Action::EditFields)
+        );
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('c'),
+            KeyCode::Char('e'),
+            KeyCode::Char('d'),
+            KeyCode::Char('P'),
+            KeyCode::Char('n'),
+        ] {
+            assert_eq!(action_for_key(key(code), &app), None, "{code:?}");
+        }
     }
 
     #[test]

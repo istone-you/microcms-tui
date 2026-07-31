@@ -31,6 +31,8 @@ microcms-tui --service-id your-service --api-key your-api-key --endpoint blogs -
 
 The TOML config contains optional `service_id`, `api_key`, and `default_endpoint` fields. Credentials can also be supplied with `MICROCMS_SERVICE_ID` and `MICROCMS_API_KEY`. Values are resolved in this order: CLI flags, environment variables, then the config file. `--endpoint` and `default_endpoint` only preselect an API; endpoint selection and switching happen inside the TUI.
 
+The endpoint picker uses Nerd Font icons for API format: codepoint `U+F0CA` for list APIs and `U+E60B` for object APIs.
+
 For environments with alternate API domains, the shared domains can be overridden with `MICROCMS_CONTENT_API_URL` and `MICROCMS_MANAGEMENT_API_URL`. Do not include the service ID or API path: for example, set `MICROCMS_CONTENT_API_URL=https://microcms-staging.net`. microcms-tui keeps the configured service ID as the subdomain and always appends the fixed `/api/v1` path, producing `https://{service_id}.microcms-staging.net/api/v1/...`. When unset or empty, the normal microCMS domains are used.
 
 Do not commit a config file containing a real API key.
@@ -119,7 +121,7 @@ Marked content rows have a yellow left bar. Content row dots use Management API 
 
 ## Object API support
 
-Object-format endpoints are supported as GET-only content. The single object returned by `GET /api/v1/{endpoint}` can be reloaded and viewed in the normal or fullscreen JSON preview. Pagination, bulk selection, create, edit, delete, and publication-status actions are disabled for Object APIs.
+Object-format endpoints are supported as GET-only content. The single object returned by `GET /api/v1/{endpoint}` is shown directly in a full-width, scrollable JSON preview without a one-item list or a separate fullscreen mode. Use `j`/`k` or the arrow keys to scroll, `g`/`G` for top/bottom, `r` to reload, and `b`/`Esc` to return to endpoint selection. GET query settings remain available. Pagination, bulk selection, create, edit, delete, and publication-status actions are disabled for Object APIs.
 
 microCMS documents Content API POST, PUT, and DELETE as list-format-only operations, so this TUI does not send them to Object APIs. PATCH requires a content ID and is not documented for Object APIs, and Management API publish/draft changes are also left unsupported rather than inferred.
 

@@ -19,6 +19,7 @@ pub struct ApiInfo {
     pub endpoint: String,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub kind: Option<ContentCollectionKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,6 +665,15 @@ fn parse_api_list(value: Value) -> Result<ApiList> {
                 endpoint: endpoint.to_string(),
                 name: string_field(object, &["name", "displayName"]).map(str::to_string),
                 description: string_field(object, &["description"]).map(str::to_string),
+                kind: string_field(object, &["type"]).and_then(|kind| {
+                    if kind.eq_ignore_ascii_case("list") {
+                        Some(ContentCollectionKind::List)
+                    } else if kind.eq_ignore_ascii_case("object") {
+                        Some(ContentCollectionKind::Object)
+                    } else {
+                        None
+                    }
+                }),
             })
         })
         .collect();
@@ -940,8 +950,8 @@ mod tests {
     fn parses_api_list_object_shape() {
         let parsed = parse_api_list(json!({
             "apis": [
-                {"endpoint": "blogs", "name": "Blog posts", "description": "Posts"},
-                {"apiId": "news", "displayName": "News", "extra": true}
+                {"endpoint": "blogs", "name": "Blog posts", "description": "Posts", "type": "list"},
+                {"apiId": "news", "displayName": "News", "type": "object", "extra": true}
             ],
             "other": "ignored"
         }))
@@ -954,11 +964,13 @@ mod tests {
                     endpoint: "blogs".into(),
                     name: Some("Blog posts".into()),
                     description: Some("Posts".into()),
+                    kind: Some(ContentCollectionKind::List),
                 },
                 ApiInfo {
                     endpoint: "news".into(),
                     name: Some("News".into()),
                     description: None,
+                    kind: Some(ContentCollectionKind::Object),
                 }
             ]
         );
@@ -978,6 +990,7 @@ mod tests {
                 endpoint: "authors".into(),
                 name: Some("Authors".into()),
                 description: None,
+                kind: None,
             }]
         );
     }

@@ -478,7 +478,9 @@ impl App {
                         let endpoint = api.endpoint.clone();
                         let endpoint_changed = self.endpoint.as_deref() != Some(endpoint.as_str());
                         let cached_schema = self.schema_cache.get(&endpoint).cloned();
-                        let cached_kind = self.content_kind_cache.get(&endpoint).copied();
+                        let cached_kind = api
+                            .kind
+                            .or_else(|| self.content_kind_cache.get(&endpoint).copied());
                         self.close_preview();
                         self.endpoint = Some(endpoint);
                         self.screen = Screen::ContentBrowser;
@@ -575,6 +577,9 @@ impl App {
             }
             Action::TogglePreviewFullscreen => {
                 if self.screen == Screen::ContentBrowser {
+                    if self.is_object_api() {
+                        return Command::None;
+                    }
                     if self.items.is_empty() {
                         self.message = Some("No content selected.".into());
                     } else {
@@ -589,22 +594,22 @@ impl App {
             }
             Action::ClosePreviewFullscreen => self.close_preview(),
             Action::PreviewScrollDown => {
-                if self.preview_fullscreen {
+                if self.preview_fullscreen || self.is_object_api() {
                     self.preview_scroll = self.preview_scroll.saturating_add(1);
                 }
             }
             Action::PreviewScrollUp => {
-                if self.preview_fullscreen {
+                if self.preview_fullscreen || self.is_object_api() {
                     self.preview_scroll = self.preview_scroll.saturating_sub(1);
                 }
             }
             Action::PreviewScrollTop => {
-                if self.preview_fullscreen {
+                if self.preview_fullscreen || self.is_object_api() {
                     self.preview_scroll = 0;
                 }
             }
             Action::PreviewScrollBottom => {
-                if self.preview_fullscreen {
+                if self.preview_fullscreen || self.is_object_api() {
                     self.preview_scroll = u16::MAX;
                 }
             }
@@ -1008,6 +1013,10 @@ impl App {
         match event {
             AppEvent::ApisLoaded(apis) => {
                 self.help_open = false;
+                self.content_kind_cache.extend(
+                    apis.iter()
+                        .filter_map(|api| api.kind.map(|kind| (api.endpoint.clone(), kind))),
+                );
                 self.apis = apis;
                 self.api_selected = self
                     .endpoint
@@ -2561,6 +2570,7 @@ mod tests {
             endpoint: "news".into(),
             name: None,
             description: None,
+            kind: None,
         }];
         app.preview_fullscreen = true;
         assert_eq!(app.apply_action(Action::Select), Command::FetchContents);
@@ -2902,7 +2912,13 @@ mod tests {
             app.apply_action(Action::TogglePreviewFullscreen),
             Command::None
         );
-        assert!(app.preview_fullscreen);
+        assert!(!app.preview_fullscreen);
+        app.apply_action(Action::PreviewScrollDown);
+        assert_eq!(app.preview_scroll, 1);
+        app.apply_action(Action::PreviewScrollBottom);
+        assert_eq!(app.preview_scroll, u16::MAX);
+        app.apply_action(Action::PreviewScrollTop);
+        assert_eq!(app.preview_scroll, 0);
     }
 
     #[test]
@@ -2936,6 +2952,7 @@ mod tests {
             endpoint: "list-endpoint".into(),
             name: None,
             description: None,
+            kind: Some(ContentCollectionKind::List),
         }];
         app.api_selected = 0;
 
@@ -2979,6 +2996,7 @@ mod tests {
             endpoint: "blogs".into(),
             name: None,
             description: None,
+            kind: Some(ContentCollectionKind::List),
         }];
         app.api_selected = 0;
         assert_eq!(app.apply_action(Action::Select), Command::FetchContents);
@@ -3564,6 +3582,7 @@ mod tests {
             endpoint: "articles".into(),
             name: None,
             description: None,
+            kind: Some(ContentCollectionKind::List),
         }];
         app.state = LoadState::ApisLoaded;
         app.schema_cache.insert(

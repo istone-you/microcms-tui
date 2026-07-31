@@ -203,11 +203,14 @@ fn draw_endpoint_picker(frame: &mut Frame, app: &App, area: Rect) {
         .apis
         .iter()
         .map(|api| {
+            let kind = api
+                .kind
+                .or_else(|| app.content_kind_cache.get(&api.endpoint).copied());
             let label = api.name.as_deref().map_or_else(
                 || api.endpoint.clone(),
                 |name| format!("{} - {name}", api.endpoint),
             );
-            ListItem::new(label)
+            ListItem::new(format!("{} {label}", endpoint_kind_icon(kind)))
         })
         .collect();
     let list = List::new(items)
@@ -226,10 +229,18 @@ fn draw_endpoint_picker(frame: &mut Frame, app: &App, area: Rect) {
         .apis
         .get(app.api_selected)
         .map(|api| {
+            let kind = api
+                .kind
+                .or_else(|| app.content_kind_cache.get(&api.endpoint).copied());
             format!(
-                "Endpoint: {}\nName: {}\n\n{}",
+                "Endpoint: {}\nName: {}\nType: {}\n\n{}",
                 api.endpoint,
                 api.name.as_deref().unwrap_or("<not set>"),
+                match kind {
+                    Some(ContentCollectionKind::List) => "list",
+                    Some(ContentCollectionKind::Object) => "object",
+                    None => "unknown",
+                },
                 api.description.as_deref().unwrap_or("No description.")
             )
         })
@@ -246,7 +257,19 @@ fn draw_endpoint_picker(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn endpoint_kind_icon(kind: Option<ContentCollectionKind>) -> &'static str {
+    match kind {
+        Some(ContentCollectionKind::Object) => "\u{e60b}",
+        Some(ContentCollectionKind::List) => "\u{f0ca}",
+        None => " ",
+    }
+}
+
 fn draw_content_browser(frame: &mut Frame, app: &App, area: Rect) {
+    if app.content_kind == ContentCollectionKind::Object {
+        draw_preview(frame, app, area, false);
+        return;
+    }
     if app.preview_fullscreen {
         draw_preview(frame, app, area, true);
         return;
@@ -281,11 +304,7 @@ fn draw_content_list(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = if app.content_kind == ContentCollectionKind::Object {
-        "Object content".to_string()
-    } else {
-        format!("Contents (page size {})", app.limit)
-    };
+    let title = format!("Contents (page size {})", app.limit);
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_symbol("> ")
@@ -355,6 +374,8 @@ fn content_status_marker(
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect, fullscreen: bool) {
+    let object = app.content_kind == ContentCollectionKind::Object;
+    let scrollable = fullscreen || object;
     let preview = app
         .items
         .get(app.content_selected)
@@ -363,12 +384,14 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect, fullscreen: bool) {
         .unwrap_or_else(|| "No content selected.".to_string());
     frame.render_widget(
         Paragraph::new(preview)
-            .block(Block::default().borders(Borders::ALL).title(if fullscreen {
+            .block(Block::default().borders(Borders::ALL).title(if object {
+                "Object JSON preview"
+            } else if fullscreen {
                 "JSON preview (fullscreen)"
             } else {
                 "JSON preview"
             }))
-            .scroll((if fullscreen { app.preview_scroll } else { 0 }, 0))
+            .scroll((if scrollable { app.preview_scroll } else { 0 }, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -401,7 +424,7 @@ fn footer_text(app: &App) -> &'static str {
         match app.screen {
             Screen::EndpointPicker => " Enter select | ? help",
             Screen::ContentBrowser if app.content_kind == ContentCollectionKind::Object => {
-                " Enter preview | ? help"
+                " j/k scroll | g/G top/bottom | r reload | b/Esc back | ? help"
             }
             Screen::ContentBrowser => " Enter preview | n/p page | ? help",
         }
@@ -417,13 +440,9 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("Object API (GET-only)"),
             Line::from("  ? open/close help"),
             Line::from(""),
-            Line::from("Navigation"),
-            Line::from("  Enter preview fullscreen   b, Esc back"),
-            Line::from("  r reload"),
-            Line::from(""),
-            Line::from("Preview fullscreen"),
+            Line::from("JSON preview"),
             Line::from("  j/k, Up/Down scroll        g/G top/bottom"),
-            Line::from("  Enter, Esc close"),
+            Line::from("  r reload                   b, Esc endpoints"),
             Line::from(""),
             Line::from("Query"),
             Line::from("  / search q   f filters   o orders   x clear query"),
@@ -974,7 +993,10 @@ mod tests {
         assert!(footer_text(&app).len() < 80);
 
         app.content_kind = ContentCollectionKind::Object;
-        assert_eq!(footer_text(&app), " Enter preview | ? help");
+        assert_eq!(
+            footer_text(&app),
+            " j/k scroll | g/G top/bottom | r reload | b/Esc back | ? help"
+        );
 
         app.input_target = Some(InputTarget::Search);
         assert!(!footer_text(&app).contains("? help"));
@@ -989,6 +1011,19 @@ mod tests {
             footer_text(&app),
             " j/k move | Space toggle | Enter apply | Esc cancel"
         );
+    }
+
+    #[test]
+    fn endpoint_kind_icons_use_requested_nerd_font_codepoints() {
+        assert_eq!(
+            endpoint_kind_icon(Some(ContentCollectionKind::Object)),
+            "\u{e60b}"
+        );
+        assert_eq!(
+            endpoint_kind_icon(Some(ContentCollectionKind::List)),
+            "\u{f0ca}"
+        );
+        assert_eq!(endpoint_kind_icon(None), " ");
     }
 
     #[test]
@@ -1043,6 +1078,30 @@ mod tests {
             .collect();
         assert_eq!(first, "[x] title");
         assert_eq!(second, "[ ] body");
+    }
+
+    #[test]
+    fn object_api_renders_only_a_full_width_json_preview() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.content_kind = ContentCollectionKind::Object;
+        app.state = LoadState::ContentsLoaded;
+        app.items = vec![serde_json::json!({"body": "Object body"})];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Object JSON preview"));
+        assert!(!rendered.contains("Contents (page size"));
+        assert!(!rendered.contains("Object content"));
     }
 
     #[test]
