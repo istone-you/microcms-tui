@@ -215,6 +215,8 @@ pub struct App {
     pub preview_fullscreen: bool,
     pub preview_scroll: u16,
     pub help_open: bool,
+    pub api_error: Option<String>,
+    pub api_error_scroll: u16,
     pub screen: Screen,
     pub state: LoadState,
     pub pending_confirmation: Option<PendingConfirmation>,
@@ -296,6 +298,9 @@ pub enum Action {
     PreviewPrevContent,
     ToggleHelp,
     CloseHelp,
+    CloseApiError,
+    ApiErrorScrollDown,
+    ApiErrorScrollUp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -456,6 +461,8 @@ impl App {
             preview_fullscreen: false,
             preview_scroll: 0,
             help_open: false,
+            api_error: None,
+            api_error_scroll: 0,
             screen: Screen::EndpointPicker,
             state,
             pending_confirmation: None,
@@ -469,6 +476,16 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::ToggleHelp => self.help_open = !self.help_open,
             Action::CloseHelp => self.help_open = false,
+            Action::CloseApiError => {
+                self.api_error = None;
+                self.api_error_scroll = 0;
+            }
+            Action::ApiErrorScrollDown => {
+                self.api_error_scroll = self.api_error_scroll.saturating_add(1);
+            }
+            Action::ApiErrorScrollUp => {
+                self.api_error_scroll = self.api_error_scroll.saturating_sub(1);
+            }
             Action::Back => {
                 if self.screen == Screen::Members {
                     self.screen = self.member_return_screen;
@@ -1257,6 +1274,7 @@ impl App {
                 if self.screen == Screen::Members || self.member_picker.is_some() {
                     self.members_loading = false;
                     self.message = Some(format!("error: {error}"));
+                    self.show_api_error(error);
                 }
             }
             AppEvent::ContentsLoaded {
@@ -1357,6 +1375,7 @@ impl App {
                     return Command::None;
                 }
                 self.message = Some(format!("error: {error}"));
+                self.show_api_error(error);
             }
             AppEvent::ReservationLoaded {
                 endpoint,
@@ -1412,6 +1431,7 @@ impl App {
                     return Command::None;
                 }
                 self.message = Some(format!("error: {error}"));
+                self.show_api_error(error);
             }
             AppEvent::FetchFailed { endpoint, error } => {
                 let should_apply = match endpoint.as_deref() {
@@ -1424,8 +1444,9 @@ impl App {
                 if !should_apply {
                     return Command::None;
                 }
-                self.state = LoadState::Error(error);
+                self.state = LoadState::Error(error.clone());
                 self.message = None;
+                self.show_api_error(error);
             }
             AppEvent::MutationSucceeded { endpoint, message } => {
                 if !self.accepts_mutation_event(&endpoint) {
@@ -1459,9 +1480,16 @@ impl App {
                 }
                 self.pending_confirmation = None;
                 self.message = Some(format!("error: {error}"));
+                self.show_api_error(error);
             }
         }
         Command::None
+    }
+
+    fn show_api_error(&mut self, error: String) {
+        self.message = None;
+        self.api_error = Some(error);
+        self.api_error_scroll = 0;
     }
 
     fn can_page(&self) -> bool {
@@ -2985,6 +3013,7 @@ mod tests {
         assert_eq!(app.items, vec![json!({"id": "content-id"})]);
         assert_eq!(app.offset, 20);
         assert_eq!(app.state, LoadState::LoadingContents);
+        assert!(app.api_error.is_none());
 
         assert_eq!(
             app.apply_event(AppEvent::MutationSucceeded {
@@ -3385,6 +3414,7 @@ mod tests {
             Command::None
         );
         assert_eq!(app.state, LoadState::Error("current failure".into()));
+        assert_eq!(app.api_error.as_deref(), Some("current failure"));
 
         let mut api_app = App::new(credentials_only_config());
         assert_eq!(api_app.screen, Screen::EndpointPicker);
@@ -3423,6 +3453,7 @@ mod tests {
             Command::None
         );
         assert_eq!(app.message.as_deref(), Some("unchanged"));
+        assert!(app.api_error.is_none());
         assert_eq!(app.state, LoadState::ContentsLoaded);
 
         assert_eq!(
@@ -3433,6 +3464,7 @@ mod tests {
             Command::None
         );
         assert_eq!(app.message.as_deref(), Some("unchanged"));
+        assert!(app.api_error.is_none());
 
         assert_eq!(
             app.apply_event(AppEvent::MutationFailed {
@@ -3490,7 +3522,8 @@ mod tests {
             }),
             Command::None
         );
-        assert_eq!(app.message.as_deref(), Some("error: request failed"));
+        assert!(app.message.is_none());
+        assert_eq!(app.api_error.as_deref(), Some("request failed"));
     }
 
     #[test]
@@ -3597,7 +3630,9 @@ mod tests {
             content_id: "id1".into(),
             error: "Selected content has no draftKey; no draft version is available.".into(),
         });
-        assert!(app.message.as_deref().unwrap().contains("no draftKey"));
+        assert!(app.message.is_none());
+        assert!(app.api_error.as_deref().unwrap().contains("no draftKey"));
+        app.apply_action(Action::CloseApiError);
         app.apply_event(AppEvent::VersionsLoaded {
             endpoint: "blogs".into(),
             content_id: "id1".into(),

@@ -214,7 +214,8 @@ fn run_loop(terminal: &mut TuiTerminal, config: Config) -> Result<()> {
 }
 
 fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option<Action> {
-    if app.help_open
+    if app.api_error.is_some()
+        || app.help_open
         || app.input_target.is_some()
         || app.member_picker.is_some()
         || app.reservation_input.is_some()
@@ -380,6 +381,14 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
         return Some(Action::Quit);
     }
     let code = key.code;
+    if app.api_error.is_some() {
+        return match code {
+            KeyCode::Esc | KeyCode::Enter => Some(Action::CloseApiError),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::ApiErrorScrollDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::ApiErrorScrollUp),
+            _ => None,
+        };
+    }
     if app.help_open {
         return match code {
             KeyCode::Char('?') => Some(Action::ToggleHelp),
@@ -1628,6 +1637,31 @@ mod tests {
         assert_eq!(action_for_key(key(KeyCode::Char('y')), &app), None);
         assert_eq!(action_for_key(key(KeyCode::Char('d')), &app), None);
         assert!(app.pending_confirmation.is_some());
+    }
+
+    #[test]
+    fn api_error_modal_blocks_underlying_keys_and_can_be_scrolled_or_closed() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.api_error = Some("403 Forbidden: permission denied".into());
+
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('j')), &app),
+            Some(Action::ApiErrorScrollDown)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('k')), &app),
+            Some(Action::ApiErrorScrollUp)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Enter), &app),
+            Some(Action::CloseApiError)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Esc), &app),
+            Some(Action::CloseApiError)
+        );
+        assert_eq!(action_for_key(key(KeyCode::Char('P')), &app), None);
     }
 
     #[test]

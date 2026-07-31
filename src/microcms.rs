@@ -267,7 +267,7 @@ impl MicroCmsClient {
                 .unwrap_or_else(|_| "<response body unavailable>".to_string());
             bail!(
                 "microCMS Management API returned HTTP {status}: {}",
-                body_snippet(&body)
+                response_body_for_error(&body)
             );
         }
         response
@@ -307,7 +307,10 @@ impl MicroCmsClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<response body unavailable>".to_string());
-            bail!("microCMS returned HTTP {status}: {}", body_snippet(&body));
+            bail!(
+                "microCMS returned HTTP {status}: {}",
+                response_body_for_error(&body)
+            );
         }
         let value = response
             .json()
@@ -343,7 +346,10 @@ impl MicroCmsClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<response body unavailable>".to_string());
-            bail!("microCMS returned HTTP {status}: {}", body_snippet(&body));
+            bail!(
+                "microCMS returned HTTP {status}: {}",
+                response_body_for_error(&body)
+            );
         }
         response
             .json()
@@ -415,7 +421,7 @@ impl MicroCmsClient {
                 .unwrap_or_else(|_| "<response body unavailable>".to_string());
             bail!(
                 "microCMS Management API returned HTTP {status}: {}",
-                body_snippet(&body)
+                response_body_for_error(&body)
             );
         }
         response
@@ -450,7 +456,7 @@ impl MicroCmsClient {
                 .unwrap_or_else(|_| "<response body unavailable>".to_string());
             bail!(
                 "microCMS Management API returned HTTP {status}: {}",
-                body_snippet(&body)
+                response_body_for_error(&body)
             );
         }
         response
@@ -575,7 +581,7 @@ impl MicroCmsClient {
                 .unwrap_or_else(|_| "<response body unavailable>".to_string());
             bail!(
                 "microCMS Management API returned HTTP {status}: {}",
-                body_snippet(&body)
+                response_body_for_error(&body)
             );
         }
         response
@@ -732,14 +738,14 @@ async fn send_mutation(request: reqwest::RequestBuilder, operation: &str) -> Res
             .unwrap_or_else(|_| "<response body unavailable>".to_string());
         bail!(
             "microCMS returned HTTP {status} while attempting to {operation}: {}",
-            body_snippet(&body)
+            response_body_for_error(&body)
         );
     }
     Ok(())
 }
 
-fn body_snippet(body: &str) -> String {
-    body.chars().take(500).collect()
+fn response_body_for_error(body: &str) -> String {
+    body.to_string()
 }
 
 fn parse_api_list(value: Value) -> Result<ApiList> {
@@ -870,6 +876,12 @@ mod tests {
             json!({"stopTime": "stop"})
         );
         assert_eq!(reservation_body(None, None), json!({}));
+    }
+
+    #[test]
+    fn api_error_response_body_is_not_truncated_or_rewritten() {
+        let body = format!("{{\"message\":\"{}\"}}", "x".repeat(600));
+        assert_eq!(response_body_for_error(&body), body);
     }
 
     #[test]

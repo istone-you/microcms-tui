@@ -49,6 +49,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.help_open {
         draw_help_modal(frame, app);
     }
+    if app.api_error.is_some() {
+        draw_api_error_modal(frame, app);
+    }
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -80,7 +83,7 @@ fn picker_status(app: &App) -> String {
         LoadState::MissingConfig(_) => "missing configuration".to_string(),
         LoadState::LoadingApis => "loading...".to_string(),
         LoadState::ApisLoaded => format!("{} available", app.apis.len()),
-        LoadState::Error(error) => format!("error: {error}"),
+        LoadState::Error(_) => format!("{} available", app.apis.len()),
         _ => format!("{} available", app.apis.len()),
     };
     if let Some(message) = &app.message {
@@ -115,7 +118,7 @@ fn content_status(app: &App) -> String {
             },
             app.offset + app.items.len()
         ),
-        LoadState::Error(error) => format!("error: {error}"),
+        LoadState::Error(_) => "ready".to_string(),
         _ => "ready".to_string(),
     };
     if let Some(message) = &app.message {
@@ -475,7 +478,9 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn footer_text(app: &App) -> &'static str {
-    if app.input_target.is_some() {
+    if app.api_error.is_some() {
+        " j/k scroll | Enter/Esc close"
+    } else if app.input_target.is_some() {
         " Enter apply | Esc cancel"
     } else if matches!(app.query_selector, Some(QuerySelector::Fields { .. })) {
         " j/k move | Space toggle | Enter apply | Esc cancel"
@@ -501,6 +506,57 @@ fn footer_text(app: &App) -> &'static str {
             Screen::ContentBrowser => " Enter preview | n/p page | ? help",
         }
     }
+}
+
+fn draw_api_error_modal(frame: &mut Frame, app: &App) {
+    let Some(error) = app.api_error.as_deref() else {
+        return;
+    };
+    let area = centered_modal_with_max_width(frame.area(), 82, 14, 100);
+    let (context, response) = api_error_parts(error);
+    let mut lines = Vec::new();
+    if let Some(context) = context {
+        lines.push(Line::from(Span::styled(
+            context,
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.extend(Text::from(response).lines);
+    let body = Text::from(lines);
+    clear_modal_background(frame, area);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(modal_style())
+            .block(
+                Block::default()
+                    .style(modal_style())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title("API error"),
+            )
+            .scroll((app.api_error_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn api_error_parts(error: &str) -> (Option<String>, String) {
+    for (index, character) in error.char_indices() {
+        if !matches!(character, '{' | '[') {
+            continue;
+        }
+        let candidate = &error[index..];
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+            continue;
+        };
+        let context = error[..index]
+            .trim_end_matches(|character: char| character == ':' || character.is_whitespace())
+            .to_string();
+        let response = serde_json::to_string_pretty(&value).unwrap_or_else(|_| candidate.into());
+        return ((!context.is_empty()).then_some(context), response);
+    }
+    (None, error.to_string())
 }
 
 fn draw_help_modal(frame: &mut Frame, app: &App) {
@@ -1218,6 +1274,63 @@ mod tests {
         assert_eq!(right_border.bg, Color::Black);
         let interior = buffer.cell((area.x + 1, area.y + 1)).unwrap();
         assert_eq!(interior.bg, Color::Black);
+    }
+
+    #[test]
+    fn api_error_modal_shows_status_and_response_body() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.api_error = Some(
+            "update content publication reservation failed: 403 Forbidden: permission denied"
+                .into(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("API error"));
+        assert!(rendered.contains("403 Forbidden: permission denied"));
+    }
+
+    #[test]
+    fn api_error_json_response_is_pretty_printed_without_changing_its_content() {
+        let (context, response) = api_error_parts(
+            "microCMS returned HTTP 400 Bad Request: {\"message\":\"invalid publishTime\",\"details\":[\"must be in the future\"]}",
+        );
+
+        assert_eq!(
+            context.as_deref(),
+            Some("microCMS returned HTTP 400 Bad Request")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+            serde_json::json!({
+                "message": "invalid publishTime",
+                "details": ["must be in the future"]
+            })
+        );
+        assert!(response.contains('\n'));
+    }
+
+    #[test]
+    fn api_error_details_are_not_repeated_in_the_status_header() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::Error("403 Forbidden: permission denied".into());
+        app.api_error = Some("403 Forbidden: permission denied".into());
+
+        let status = content_status(&app);
+        assert!(!status.contains("403 Forbidden"));
+        assert!(!status.contains("permission denied"));
+        assert!(!status.contains("error"));
     }
 
     #[test]
