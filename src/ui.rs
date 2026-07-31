@@ -5,10 +5,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{
     content_id, content_label, ordered_content_for_display, App, ContentPublicationState,
-    InputTarget, LoadState, PendingConfirmation, Screen,
+    InputTarget, LoadState, PendingConfirmation, QuerySelector, ReservationField, Screen,
+    VersionView,
 };
 use crate::microcms::ContentCollectionKind;
 
@@ -27,6 +29,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_help(frame, app, areas[2]);
     if app.input_target.is_some() {
         draw_input_modal(frame, app);
+    }
+    if app.query_selector.is_some() {
+        draw_query_selector_modal(frame, app);
+    }
+    if app.reservation_input.is_some() {
+        draw_reservation_modal(frame, app);
+    }
+    if app.version_comparison.is_some() {
+        draw_version_comparison(frame, app);
     }
     if app.pending_confirmation.is_some() {
         draw_confirmation_modal(frame, app);
@@ -92,6 +103,21 @@ fn content_status(app: &App) -> String {
     if let Some(orders) = &app.orders {
         query_state.push(format!("orders:{}", truncate_inline(orders, 18)));
     }
+    if app.fields.is_some() {
+        query_state.push("fields:*".to_string());
+    }
+    if let Some(depth) = app.depth {
+        query_state.push(format!("depth:{depth}"));
+    }
+    if app.ids.is_some() {
+        query_state.push("ids:*".to_string());
+    }
+    if app.draft_key.is_some() {
+        query_state.push("draftKey:*".to_string());
+    }
+    if let Some(format) = &app.rich_editor_format {
+        query_state.push(format!("richEditorFormat:{format}"));
+    }
     if !query_state.is_empty() {
         state.push_str(" | ");
         state.push_str(&query_state.join(" "));
@@ -99,7 +125,32 @@ fn content_status(app: &App) -> String {
     if !app.selected_content_ids.is_empty() {
         state.push_str(&format!(" | selected:{}", app.selected_content_ids.len()));
     }
+    if let Some(reservation) = app
+        .items
+        .get(app.content_selected)
+        .and_then(|value| app.reservation_for(value))
+    {
+        state.push_str(" | scheduled:");
+        state.push_str(&reservation_summary(reservation));
+    }
     format!(" microcms-tui | endpoint: {endpoint} | {state}")
+}
+
+fn reservation_summary(reservation: &crate::microcms::ReservationTime) -> String {
+    let publish = reservation
+        .publish_time
+        .as_deref()
+        .map(|value| truncate_inline(value, 20));
+    let stop = reservation
+        .stop_time
+        .as_deref()
+        .map(|value| truncate_inline(value, 20));
+    match (publish, stop) {
+        (Some(publish), Some(stop)) => format!("publish {publish}, stop {stop}"),
+        (Some(publish), None) => format!("publish {publish}"),
+        (None, Some(stop)) => format!("stop {stop}"),
+        (None, None) => "none".into(),
+    }
 }
 
 fn truncate_inline(value: &str, max_chars: usize) -> String {
@@ -218,7 +269,10 @@ fn draw_content_list(frame: &mut Frame, app: &App, area: Rect) {
                 .map(|id| app.selected_content_ids.contains(id))
                 .unwrap_or(false);
             let mut spans = vec![selected_bar(is_selected)];
-            spans.extend(status_marker(app.publication_state_for(value)));
+            spans.extend(content_status_marker(
+                app.publication_state_for(value),
+                app.reservation_for(value).is_some(),
+            ));
             spans.push(Span::raw(format!(
                 "{:>4}  {}",
                 app.offset + index + 1,
@@ -267,6 +321,39 @@ fn status_marker(state: ContentPublicationState) -> Vec<Span<'static>> {
     }
 }
 
+fn scheduled_status_marker() -> Span<'static> {
+    Span::styled("● ", Style::default().fg(Color::Magenta))
+}
+
+fn content_status_marker(
+    publication_state: ContentPublicationState,
+    scheduled: bool,
+) -> Vec<Span<'static>> {
+    if !scheduled {
+        return status_marker(publication_state);
+    }
+    let mut markers = match publication_state {
+        ContentPublicationState::Published => {
+            vec![Span::styled("●", Style::default().fg(Color::Green))]
+        }
+        ContentPublicationState::Draft => {
+            vec![Span::styled("●", Style::default().fg(Color::Cyan))]
+        }
+        ContentPublicationState::PublishedAndDraft => vec![
+            Span::styled("●", Style::default().fg(Color::Green)),
+            Span::styled("●", Style::default().fg(Color::Cyan)),
+        ],
+        ContentPublicationState::Closed => {
+            vec![Span::styled("●", Style::default().fg(Color::Red))]
+        }
+        ContentPublicationState::Unknown => {
+            vec![Span::styled("●", Style::default().fg(Color::DarkGray))]
+        }
+    };
+    markers.push(scheduled_status_marker());
+    markers
+}
+
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect, fullscreen: bool) {
     let preview = app
         .items
@@ -298,8 +385,16 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 fn footer_text(app: &App) -> &'static str {
     if app.input_target.is_some() {
         " Enter apply | Esc cancel"
+    } else if matches!(app.query_selector, Some(QuerySelector::Fields { .. })) {
+        " j/k move | Space toggle | Enter apply | Esc cancel"
+    } else if app.query_selector.is_some() {
+        " j/k choose | Enter apply | Esc cancel"
+    } else if app.reservation_input.is_some() {
+        " Tab field | Enter review | F8 clear | Esc cancel"
     } else if app.pending_confirmation.is_some() {
         " y confirm | n/Esc cancel | ? help"
+    } else if app.version_comparison.is_some() {
+        " 1 published | 2 draft | j/k scroll | Enter/Esc close"
     } else if app.preview_fullscreen {
         " Enter/Esc close | n/p content | ? help"
     } else {
@@ -350,7 +445,8 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from(""),
             Line::from("Query"),
             Line::from("  / search q                  f filters"),
-            Line::from("  o orders                    x clear query"),
+            Line::from("  o orders   l fields selector   z depth selector"),
+            Line::from("  i IDs   K draftKey   m format selector   x clear"),
             Line::from(""),
             Line::from("Content write"),
             Line::from("  c/C POST default/draft      u/U PUT with ID default/draft"),
@@ -359,13 +455,16 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("Bulk / Status"),
             Line::from("  Space mark current          d delete marked/current"),
             Line::from("  P publish (Management API)  D draft (Management API)"),
+            Line::from("  s publication reservation   v published/draft comparison"),
         ])
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(help)
+            .style(modal_style())
             .block(
                 Block::default()
+                    .style(modal_style())
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow))
                     .title("Help"),
@@ -383,18 +482,264 @@ fn draw_input_modal(frame: &mut Frame, app: &App) {
         InputTarget::Search => "Search",
         InputTarget::Filters => "Filters",
         InputTarget::Orders => "Orders",
+        InputTarget::Ids => "IDs",
+        InputTarget::DraftKey => "Draft key",
         InputTarget::CreateWithId(_) => "Content ID",
     };
     let area = centered_modal(frame.area(), 70, 3);
-    let input = Text::from(Line::from(format!("{} _", app.input_buffer)));
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let (input, cursor_column) = visible_input(&app.input_buffer, app.input_cursor, inner_width);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(input)
+            .style(modal_style())
             .block(
                 Block::default()
+                    .style(modal_style())
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow))
                     .title(title),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    frame.set_cursor_position((area.x + 1 + cursor_column, area.y + 1));
+}
+
+fn draw_query_selector_modal(frame: &mut Frame, app: &App) {
+    let Some(selector) = app.query_selector.as_ref() else {
+        return;
+    };
+    let (title, cursor, entries): (&str, usize, Vec<Line<'static>>) = match selector {
+        QuerySelector::Fields { cursor, selected } => (
+            "Fields",
+            *cursor,
+            app.content_field_order
+                .iter()
+                .map(|field| {
+                    Line::from(format!(
+                        "[{}] {field}",
+                        if selected.contains(field) { "x" } else { " " }
+                    ))
+                })
+                .collect(),
+        ),
+        QuerySelector::Depth { cursor } => (
+            "Depth",
+            *cursor,
+            ["unset", "0", "1", "2", "3"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    Line::from(format!(
+                        "({}) {value}",
+                        if index == *cursor { "*" } else { " " }
+                    ))
+                })
+                .collect(),
+        ),
+        QuerySelector::RichEditorFormat { cursor } => (
+            "Rich editor format",
+            *cursor,
+            ["unset", "html", "object"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    Line::from(format!(
+                        "({}) {value}",
+                        if index == *cursor { "*" } else { " " }
+                    ))
+                })
+                .collect(),
+        ),
+    };
+    let height = (entries.len() as u16 + 2).clamp(5, 20);
+    let area = centered_modal_with_max_width(frame.area(), 64, height, 72);
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let first = cursor.saturating_add(1).saturating_sub(visible_rows.max(1));
+    let visible = entries
+        .into_iter()
+        .skip(first)
+        .take(visible_rows)
+        .enumerate()
+        .map(|(index, line)| {
+            if first + index == cursor {
+                line.style(Style::default().fg(Color::Yellow))
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(visible).style(modal_style()).block(
+            Block::default()
+                .style(modal_style())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(title),
+        ),
+        area,
+    );
+}
+
+fn draw_reservation_modal(frame: &mut Frame, app: &App) {
+    let Some(input) = app.reservation_input.as_ref() else {
+        return;
+    };
+    let (status, rule) = reservation_status_hint(input.publication_state);
+    let area = centered_modal_with_max_width(frame.area(), 76, 10, 82);
+    let publish_label = "Publish time: ";
+    let stop_label = "Stop time:    ";
+    let field_width = area.width.saturating_sub(2 + publish_label.len() as u16) as usize;
+    let (publish_time, publish_cursor) =
+        visible_input(&input.publish_time, input.publish_cursor, field_width);
+    let (stop_time, stop_cursor) = visible_input(&input.stop_time, input.stop_cursor, field_width);
+    let field_line = |label: &'static str, value: String, active: bool| {
+        Line::from(vec![
+            Span::styled(
+                label,
+                if active {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    modal_style()
+                },
+            ),
+            Span::raw(value),
+        ])
+    };
+    let text = Text::from(vec![
+        Line::from(format!("Current status: {status}")),
+        field_line(
+            publish_label,
+            publish_time,
+            input.active_field == ReservationField::PublishTime,
+        ),
+        field_line(
+            stop_label,
+            stop_time,
+            input.active_field == ReservationField::StopTime,
+        ),
+        Line::from(""),
+        Line::from("Format: YYYY-MM-DD HH:MM (local time) or ISO 8601"),
+        Line::from(rule),
+        Line::from("Tab field | Enter review | F8 clear | Esc cancel"),
+    ]);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(modal_style())
+            .block(
+                Block::default()
+                    .style(modal_style())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title("Publication reservation"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    if !app.help_open {
+        let (line, cursor) = match input.active_field {
+            ReservationField::PublishTime => (area.y + 2, publish_cursor),
+            ReservationField::StopTime => (area.y + 3, stop_cursor),
+        };
+        frame.set_cursor_position((area.x + 1 + publish_label.len() as u16 + cursor, line));
+    }
+}
+
+fn visible_input(value: &str, cursor: usize, max_width: usize) -> (String, u16) {
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let width = |character: char| UnicodeWidthChar::width(character).unwrap_or(0);
+    let mut start = cursor;
+    let mut cursor_width = 0;
+    while start > 0 {
+        let character_width = width(chars[start - 1]);
+        if cursor_width + character_width >= max_width.max(1) {
+            break;
+        }
+        cursor_width += character_width;
+        start -= 1;
+    }
+    let mut visible_width = 0;
+    let visible: String = chars[start..]
+        .iter()
+        .copied()
+        .take_while(|character| {
+            let character_width = width(*character);
+            if visible_width + character_width > max_width {
+                false
+            } else {
+                visible_width += character_width;
+                true
+            }
+        })
+        .collect();
+    (visible, cursor_width as u16)
+}
+
+fn reservation_status_hint(state: ContentPublicationState) -> (&'static str, &'static str) {
+    match state {
+        ContentPublicationState::Published => (
+            "published",
+            "Published: set stop only, or stop first and the next publish later.",
+        ),
+        ContentPublicationState::Draft => (
+            "draft",
+            "Draft: set publish only, or publish first and stop later.",
+        ),
+        ContentPublicationState::Closed => (
+            "closed",
+            "Closed: set publish only, or publish first and stop later.",
+        ),
+        ContentPublicationState::PublishedAndDraft => (
+            "published + draft",
+            "Start/end availability depends on the current published and draft versions.",
+        ),
+        ContentPublicationState::Unknown => (
+            "unknown",
+            "Reservation availability will be validated by the Management API.",
+        ),
+    }
+}
+
+fn draw_version_comparison(frame: &mut Frame, app: &App) {
+    let Some(comparison) = app.version_comparison.as_ref() else {
+        return;
+    };
+    let area = centered_percent_rect(frame.area(), 92, 88);
+    let (title, body) = match comparison.view {
+        VersionView::Published => (
+            "Published version",
+            serde_json::to_string_pretty(&ordered_content_for_display(
+                &comparison.published,
+                &app.content_field_order,
+                true,
+            ))
+            .unwrap_or_else(|error| format!("Failed to render JSON: {error}")),
+        ),
+        VersionView::Draft => (
+            "Draft version",
+            serde_json::to_string_pretty(&ordered_content_for_display(
+                &comparison.draft,
+                &app.content_field_order,
+                true,
+            ))
+            .unwrap_or_else(|error| format!("Failed to render JSON: {error}")),
+        ),
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(modal_style())
+            .scroll((comparison.scroll, 0))
+            .block(
+                Block::default()
+                    .style(modal_style())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(format!("{title} | 1 published | 2 draft")),
             )
             .wrap(Wrap { trim: false }),
         area,
@@ -417,8 +762,10 @@ fn draw_confirmation_modal(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(confirmation)
+            .style(modal_style())
             .block(
                 Block::default()
+                    .style(modal_style())
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow))
                     .title(title),
@@ -480,6 +827,23 @@ fn confirmation_text(
             },
             "This operation may change publication state.",
         ),
+        PendingConfirmation::Reservation {
+            publish_time,
+            stop_time,
+            ..
+        } => (
+            "Confirm reservation",
+            if publish_time.is_none() && stop_time.is_none() {
+                "Remove the current publication reservation?".into()
+            } else {
+                format!(
+                    "Set reservation: publish {}, stop {}?",
+                    publish_time.as_deref().unwrap_or("-"),
+                    stop_time.as_deref().unwrap_or("-")
+                )
+            },
+            "Existing reservation settings will be overwritten.",
+        ),
         PendingConfirmation::PublicationStatus {
             content_ids,
             status: crate::microcms::PublicationStatus::Draft,
@@ -497,6 +861,10 @@ fn confirmation_text(
 
 fn centered_modal(area: Rect, percent_width: u16, height: u16) -> Rect {
     centered_modal_with_max_width(area, percent_width, height, 100)
+}
+
+fn modal_style() -> Style {
+    Style::default().fg(Color::White).bg(Color::Black)
 }
 
 fn centered_modal_with_max_width(
@@ -522,8 +890,29 @@ fn centered_modal_with_max_width(
     }
 }
 
+fn centered_percent_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let width = area
+        .width
+        .saturating_mul(width_percent)
+        .saturating_div(100)
+        .max(1);
+    let height = area
+        .height
+        .saturating_mul(height_percent)
+        .saturating_div(100)
+        .max(1);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
     use super::*;
 
     #[test]
@@ -546,6 +935,36 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_status_appends_an_adjacent_magenta_dot() {
+        let scheduled = content_status_marker(ContentPublicationState::PublishedAndDraft, true);
+        assert_eq!(scheduled.len(), 3);
+        assert_eq!(scheduled[0].content.as_ref(), "●");
+        assert_eq!(scheduled[0].style.fg, Some(Color::Green));
+        assert_eq!(scheduled[1].content.as_ref(), "●");
+        assert_eq!(scheduled[1].style.fg, Some(Color::Cyan));
+        assert_eq!(scheduled[2].content.as_ref(), "● ");
+        assert_eq!(scheduled[2].style.fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn reservation_summary_supports_start_end_and_both() {
+        use crate::microcms::ReservationTime;
+
+        assert_eq!(
+            reservation_summary(&ReservationTime {
+                publish_time: Some("2026-08-01T00:00:00Z".into()),
+                stop_time: None,
+            }),
+            "publish 2026-08-01T00:00:00Z"
+        );
+        assert!(reservation_summary(&ReservationTime {
+            publish_time: Some("start".into()),
+            stop_time: Some("stop".into()),
+        })
+        .contains("publish start, stop stop"));
+    }
+
+    #[test]
     fn footers_are_short_and_offer_help_except_during_input() {
         let mut app = App::new(crate::config::Config::default());
         assert_eq!(footer_text(&app), " Enter select | ? help");
@@ -560,6 +979,70 @@ mod tests {
         app.input_target = Some(InputTarget::Search);
         assert!(!footer_text(&app).contains("? help"));
         assert_eq!(footer_text(&app), " Enter apply | Esc cancel");
+
+        app.input_target = None;
+        app.query_selector = Some(QuerySelector::Fields {
+            cursor: 0,
+            selected: Default::default(),
+        });
+        assert_eq!(
+            footer_text(&app),
+            " j/k move | Space toggle | Enter apply | Esc cancel"
+        );
+    }
+
+    #[test]
+    fn modal_background_is_opaque_and_right_border_remains_visible() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.input_target = Some(InputTarget::Search);
+        app.input_buffer = "query".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let area = centered_modal(Rect::new(0, 0, 80, 24), 70, 3);
+        let buffer = terminal.backend().buffer();
+        let right_border = buffer.cell((area.right() - 1, area.y + 1)).unwrap();
+        assert_eq!(right_border.symbol(), "│");
+        assert_eq!(right_border.bg, Color::Black);
+        let interior = buffer.cell((area.x + 1, area.y + 1)).unwrap();
+        assert_eq!(interior.bg, Color::Black);
+    }
+
+    #[test]
+    fn input_view_uses_real_cursor_without_fake_underscore_or_padding() {
+        let (visible, cursor) = visible_input("b6h70np_q", 9, 20);
+        assert_eq!(visible, "b6h70np_q");
+        assert_eq!(cursor, 9);
+        assert!(!visible.ends_with(" _"));
+
+        let (visible, cursor) = visible_input("日本語abc", 2, 20);
+        assert_eq!(visible, "日本語abc");
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn fields_modal_renders_schema_candidates_as_checkboxes() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.content_field_order = vec!["title".into(), "body".into()];
+        app.query_selector = Some(QuerySelector::Fields {
+            cursor: 0,
+            selected: ["title".to_string()].into_iter().collect(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let area = centered_modal_with_max_width(Rect::new(0, 0, 80, 24), 64, 5, 72);
+        let buffer = terminal.backend().buffer();
+        let first: String = (area.x + 1..area.x + 10)
+            .map(|x| buffer.cell((x, area.y + 1)).unwrap().symbol())
+            .collect();
+        let second: String = (area.x + 1..area.x + 9)
+            .map(|x| buffer.cell((x, area.y + 2)).unwrap().symbol())
+            .collect();
+        assert_eq!(first, "[x] title");
+        assert_eq!(second, "[ ] body");
     }
 
     #[test]
@@ -608,6 +1091,18 @@ mod tests {
             )
             .0,
             "Confirm delete"
+        );
+        assert_eq!(
+            confirmation_text(
+                &app,
+                &PendingConfirmation::Reservation {
+                    content_id: "id".into(),
+                    publish_time: None,
+                    stop_time: None,
+                }
+            )
+            .1,
+            "Remove the current publication reservation?"
         );
     }
 }

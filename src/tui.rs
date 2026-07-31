@@ -20,7 +20,7 @@ use crate::{
     app::{
         content_field_order_from_api_schema, content_id, content_publication_state,
         create_template_from_api_schema, sanitized_payload, Action, App, AppEvent, Command,
-        LoadState, PendingConfirmation, Screen,
+        LoadState, PendingConfirmation, Screen, TextEditAction,
     },
     config::Config,
     microcms::{
@@ -52,6 +52,11 @@ enum MutationRequest {
     Status {
         content_ids: Vec<String>,
         status: PublicationStatus,
+    },
+    Reservation {
+        content_id: String,
+        publish_time: Option<String>,
+        stop_time: Option<String>,
     },
 }
 
@@ -195,11 +200,36 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
     }
     if app.input_target.is_some() {
         return match code {
-            KeyCode::Char(character) => Some(Action::InputChar(character)),
-            KeyCode::Backspace => Some(Action::InputBackspace),
             KeyCode::Enter => Some(Action::InputApply),
             KeyCode::Esc => Some(Action::InputCancel),
+            _ => text_edit_action(key)
+                .map(Action::InputEdit)
+                .or_else(|| printable_character(key).map(Action::InputChar)),
+        };
+    }
+    if app.query_selector.is_some() {
+        return match code {
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::QuerySelectorMoveDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::QuerySelectorMoveUp),
+            KeyCode::Char(' ') => Some(Action::QuerySelectorToggle),
+            KeyCode::Enter => Some(Action::QuerySelectorApply),
+            KeyCode::Esc => Some(Action::QuerySelectorCancel),
             _ => None,
+        };
+    }
+    if app.reservation_input.is_some() {
+        return match code {
+            KeyCode::Char('?') if key.modifiers.is_empty() => Some(Action::ToggleHelp),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                Some(Action::ReservationNextField)
+            }
+            KeyCode::Enter => Some(Action::ReservationApply),
+            KeyCode::F(8) => Some(Action::ReservationClear),
+            KeyCode::Esc => Some(Action::ReservationCancel),
+            _ => text_edit_action(key)
+                .map(Action::ReservationEdit)
+                .or_else(|| printable_character(key).map(Action::ReservationInputChar)),
         };
     }
     if app.pending_confirmation.is_some() {
@@ -207,6 +237,17 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('?') => Some(Action::ToggleHelp),
             KeyCode::Char('y') => Some(Action::ConfirmPending),
             KeyCode::Char('n') | KeyCode::Esc => Some(Action::CancelPending),
+            _ => None,
+        };
+    }
+    if app.version_comparison.is_some() {
+        return match code {
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Esc | KeyCode::Enter => Some(Action::CloseVersionComparison),
+            KeyCode::Char('1') => Some(Action::VersionPublished),
+            KeyCode::Char('2') => Some(Action::VersionDraft),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::VersionScrollDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::VersionScrollUp),
             _ => None,
         };
     }
@@ -225,6 +266,8 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('d') => Some(Action::DeleteRequest),
             KeyCode::Char('P') => Some(Action::Publish),
             KeyCode::Char('D') => Some(Action::Draft),
+            KeyCode::Char('s') => Some(Action::EditReservation),
+            KeyCode::Char('v') => Some(Action::CompareVersions),
             _ => None,
         };
     }
@@ -254,15 +297,67 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('/') if app.screen == Screen::ContentBrowser => Some(Action::EditSearch),
         KeyCode::Char('f') if app.screen == Screen::ContentBrowser => Some(Action::EditFilters),
         KeyCode::Char('o') if app.screen == Screen::ContentBrowser => Some(Action::EditOrders),
+        KeyCode::Char('l') if app.screen == Screen::ContentBrowser => Some(Action::EditFields),
+        KeyCode::Char('z') if app.screen == Screen::ContentBrowser => Some(Action::EditDepth),
+        KeyCode::Char('i') if app.screen == Screen::ContentBrowser => Some(Action::EditIds),
+        KeyCode::Char('K') if app.screen == Screen::ContentBrowser => Some(Action::EditDraftKey),
+        KeyCode::Char('m') if app.screen == Screen::ContentBrowser => {
+            Some(Action::EditRichEditorFormat)
+        }
         KeyCode::Char('x') if app.screen == Screen::ContentBrowser => Some(Action::ClearQuery),
         KeyCode::Char('P') if app.screen == Screen::ContentBrowser => Some(Action::Publish),
         KeyCode::Char('D') if app.screen == Screen::ContentBrowser => Some(Action::Draft),
+        KeyCode::Char('s') if app.screen == Screen::ContentBrowser => Some(Action::EditReservation),
+        KeyCode::Char('v') if app.screen == Screen::ContentBrowser => Some(Action::CompareVersions),
         KeyCode::Char('n') | KeyCode::PageDown if app.screen == Screen::ContentBrowser => {
             Some(Action::NextPage)
         }
         KeyCode::Char('p') | KeyCode::PageUp if app.screen == Screen::ContentBrowser => {
             Some(Action::PrevPage)
         }
+        _ => None,
+    }
+}
+
+fn printable_character(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(character)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(character)
+        }
+        _ => None,
+    }
+}
+
+fn text_edit_action(key: KeyEvent) -> Option<TextEditAction> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace if alt => Some(TextEditAction::DeletePrevWord),
+        KeyCode::Backspace => Some(TextEditAction::Backspace),
+        KeyCode::Delete => Some(TextEditAction::Delete),
+        KeyCode::Home => Some(TextEditAction::MoveStart),
+        KeyCode::End => Some(TextEditAction::MoveEnd),
+        KeyCode::Left if control || alt => Some(TextEditAction::MoveWordLeft),
+        KeyCode::Right if control || alt => Some(TextEditAction::MoveWordRight),
+        KeyCode::Left => Some(TextEditAction::MoveLeft),
+        KeyCode::Right => Some(TextEditAction::MoveRight),
+        KeyCode::Char('a') if control => Some(TextEditAction::MoveStart),
+        KeyCode::Char('e') if control => Some(TextEditAction::MoveEnd),
+        KeyCode::Char('b') if control => Some(TextEditAction::MoveLeft),
+        KeyCode::Char('f') if control => Some(TextEditAction::MoveRight),
+        KeyCode::Char('b') if alt => Some(TextEditAction::MoveWordLeft),
+        KeyCode::Char('f') if alt => Some(TextEditAction::MoveWordRight),
+        KeyCode::Char('h') if control => Some(TextEditAction::Backspace),
+        KeyCode::Char('d') if control => Some(TextEditAction::Delete),
+        KeyCode::Char('u') if control => Some(TextEditAction::DeleteToStart),
+        KeyCode::Char('k') if control => Some(TextEditAction::DeleteToEnd),
+        KeyCode::Char('w') if control => Some(TextEditAction::DeletePrevWord),
+        KeyCode::Char('d') if alt => Some(TextEditAction::DeleteNextWord),
+        KeyCode::Char('t') if control => Some(TextEditAction::Transpose),
+        KeyCode::Char('y') if control => Some(TextEditAction::Yank),
         _ => None,
     }
 }
@@ -275,7 +370,10 @@ fn handle_command(
 ) {
     match command {
         Command::None => {}
-        fetch @ (Command::FetchApis | Command::FetchContents) => schedule_fetch(app, fetch, tx),
+        fetch @ (Command::FetchApis
+        | Command::FetchContents
+        | Command::FetchVersions { .. }
+        | Command::FetchReservation { .. }) => schedule_fetch(app, fetch, tx),
         Command::Create { template, status } => match edit_json(terminal, "create", &template) {
             Ok(EditResult::Changed(value)) => {
                 let value = sanitized_payload(&value);
@@ -350,7 +448,9 @@ fn queue_write_mutation(
                     format!("Creating draft content with ID {content_id}...")
                 }
                 MutationRequest::Update { .. } => "Updating draft content...".into(),
-                MutationRequest::Delete { .. } | MutationRequest::Status { .. } => {
+                MutationRequest::Delete { .. }
+                | MutationRequest::Status { .. }
+                | MutationRequest::Reservation { .. } => {
                     unreachable!("only content writes are queued here")
                 }
             });
@@ -419,6 +519,22 @@ fn schedule_confirmed_mutation(
                 status,
             }
         }
+        PendingConfirmation::Reservation {
+            content_id,
+            publish_time,
+            stop_time,
+        } => {
+            app.message = Some(if publish_time.is_none() && stop_time.is_none() {
+                "Removing publication reservation...".into()
+            } else {
+                "Updating publication reservation...".into()
+            });
+            MutationRequest::Reservation {
+                content_id,
+                publish_time,
+                stop_time,
+            }
+        }
     };
     schedule_mutation(app, mutation, tx);
 }
@@ -444,14 +560,30 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
     let endpoint = app.endpoint.clone();
     let offset = app.offset;
     let limit = app.limit;
+    let expected_content_kind = app.content_kind_confirmed.then_some(app.content_kind);
     let query = ContentQuery {
         q: app.search_query.clone(),
         filters: app.filters.clone(),
         orders: app.orders.clone(),
+        fields: fields_with_content_id(app.fields.as_deref()),
+        depth: app.depth,
+        ids: app.ids.clone(),
+        draft_key: app.draft_key.clone(),
+        rich_editor_format: app.rich_editor_format.clone(),
     };
-    let needs_schema = app.create_template.is_none();
+    let needs_schema = should_fetch_schema(app, endpoint.as_deref());
+    let is_version_fetch = matches!(&command, Command::FetchVersions { .. });
+    let is_reservation_fetch = matches!(&command, Command::FetchReservation { .. });
+    let auxiliary_content_id = match &command {
+        Command::FetchVersions { content_id } | Command::FetchReservation { content_id } => {
+            content_id.clone()
+        }
+        _ => String::new(),
+    };
     let failure_endpoint = match &command {
-        Command::FetchContents => endpoint.clone(),
+        Command::FetchContents
+        | Command::FetchVersions { .. }
+        | Command::FetchReservation { .. } => endpoint.clone(),
         _ => None,
     };
 
@@ -466,21 +598,48 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                 Command::FetchContents => {
                     let endpoint = endpoint.context("endpoint is missing")?;
                     let collection = client
-                        .get_content_collection(&endpoint, limit, offset, &query)
+                        .get_content_collection(
+                            &endpoint,
+                            limit,
+                            offset,
+                            &query,
+                            expected_content_kind,
+                        )
                         .await?;
-                    let (statuses, status_warning) = if collection.kind
+                    let (statuses, draft_keys, reservations, status_warning) = if collection.kind
                         == ContentCollectionKind::List
                     {
                         match client.list_content_metadata(&endpoint, limit, offset).await {
                             Ok(metadata) => {
                                 let statuses: HashMap<_, _> = metadata
                                     .contents
-                                    .into_iter()
+                                    .iter()
                                     .map(|content| {
                                         (
-                                            content.id,
+                                            content.id.clone(),
                                             content_publication_state(&content.status),
                                         )
+                                    })
+                                    .collect();
+                                let draft_keys = metadata
+                                    .contents
+                                    .iter()
+                                    .filter_map(|content| {
+                                        content
+                                            .draft_key
+                                            .as_ref()
+                                            .filter(|key| !key.is_empty())
+                                            .map(|key| (content.id.clone(), key.clone()))
+                                    })
+                                    .collect();
+                                let reservations = metadata
+                                    .contents
+                                    .iter()
+                                    .filter_map(|content| {
+                                        content
+                                            .reservation_time
+                                            .clone()
+                                            .map(|value| (content.id.clone(), value))
                                     })
                                     .collect();
                                 let has_missing = collection.contents.iter().any(|value| {
@@ -490,9 +649,11 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                                 let warning = has_missing.then(|| {
                                     "Content loaded; status metadata could not be matched for some items (query/filter/order may affect alignment).".to_string()
                                 });
-                                (statuses, warning)
+                                (statuses, draft_keys, reservations, warning)
                             }
                             Err(error) => (
+                                HashMap::new(),
+                                HashMap::new(),
                                 HashMap::new(),
                                 Some(format!(
                                     "Content loaded; status metadata unavailable: {error:#}"
@@ -500,7 +661,7 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                             ),
                         }
                     } else {
-                        (HashMap::new(), None)
+                        (HashMap::new(), HashMap::new(), HashMap::new(), None)
                     };
                     let (create_template, content_field_order, schema_warning) = if needs_schema {
                         match client.get_api_schema(&endpoint).await {
@@ -524,6 +685,47 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                         create_template,
                         content_field_order,
                         schema_warning,
+                        draft_keys,
+                        reservations,
+                    })
+                }
+                Command::FetchVersions { content_id } => {
+                    let endpoint = endpoint.context("endpoint is missing")?;
+                    let metadata = client.get_content_metadata(&endpoint, &content_id).await?;
+                    let draft_key = metadata.draft_key.filter(|value| !value.is_empty()).context(
+                        "Selected content has no draftKey; no draft version is available.",
+                    )?;
+                    let base_query = ContentQuery {
+                        fields: query.fields.clone(),
+                        depth: query.depth,
+                        rich_editor_format: query.rich_editor_format.clone(),
+                        ..ContentQuery::default()
+                    };
+                    let published = client
+                        .get_content_version(&endpoint, &content_id, &base_query)
+                        .await?;
+                    let draft_query = ContentQuery {
+                        draft_key: Some(draft_key),
+                        ..base_query
+                    };
+                    let draft = client
+                        .get_content_version(&endpoint, &content_id, &draft_query)
+                        .await?;
+                    Ok(AppEvent::VersionsLoaded {
+                        endpoint,
+                        content_id,
+                        published,
+                        draft,
+                    })
+                }
+                Command::FetchReservation { content_id } => {
+                    let endpoint = endpoint.context("endpoint is missing")?;
+                    let metadata = client.get_content_metadata(&endpoint, &content_id).await?;
+                    Ok(AppEvent::ReservationLoaded {
+                        endpoint,
+                        content_id,
+                        reservation: metadata.reservation_time,
+                        publication_state: content_publication_state(&metadata.status),
                     })
                 }
                 _ => bail!("invalid fetch command"),
@@ -533,6 +735,16 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
 
         let event = match result {
             Ok(event) => event,
+            Err(error) if is_version_fetch => AppEvent::VersionsFailed {
+                endpoint: failure_endpoint.unwrap_or_default(),
+                content_id: auxiliary_content_id,
+                error: format!("{error:#}"),
+            },
+            Err(error) if is_reservation_fetch => AppEvent::ReservationFailed {
+                endpoint: failure_endpoint.unwrap_or_default(),
+                content_id: auxiliary_content_id,
+                error: format!("{error:#}"),
+            },
             Err(error) => AppEvent::FetchFailed {
                 endpoint: failure_endpoint,
                 error: format!("{error:#}"),
@@ -540,6 +752,26 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
         };
         let _ = tx.send(event);
     });
+}
+
+fn should_fetch_schema(app: &App, endpoint: Option<&str>) -> bool {
+    endpoint.is_some_and(|endpoint| !app.schema_cache.contains_key(endpoint))
+}
+
+fn fields_with_content_id(fields: Option<&str>) -> Option<String> {
+    let fields = fields?.trim();
+    if fields.is_empty() {
+        return None;
+    }
+    let mut values: Vec<&str> = fields
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .collect();
+    if !values.contains(&"id") {
+        values.push("id");
+    }
+    Some(values.join(","))
 }
 
 fn schedule_mutation(app: &App, mutation: MutationRequest, tx: mpsc::UnboundedSender<AppEvent>) {
@@ -640,6 +872,28 @@ fn schedule_mutation(app: &App, mutation: MutationRequest, tx: mpsc::UnboundedSe
                             (PublicationStatus::Draft, count) => {
                                 format!("{count} contents set to draft.")
                             }
+                        },
+                    })
+                }
+                MutationRequest::Reservation {
+                    content_id,
+                    publish_time,
+                    stop_time,
+                } => {
+                    client
+                        .update_reservation(
+                            &endpoint,
+                            &content_id,
+                            publish_time.as_deref(),
+                            stop_time.as_deref(),
+                        )
+                        .await?;
+                    Ok(AppEvent::MutationSucceeded {
+                        endpoint: endpoint.clone(),
+                        message: if publish_time.is_none() && stop_time.is_none() {
+                            "Publication reservation removed; page reloaded.".into()
+                        } else {
+                            "Publication reservation updated; page reloaded.".into()
                         },
                     })
                 }
@@ -1080,6 +1334,192 @@ mod tests {
             action_for_key(key(KeyCode::Char('E')), &app),
             Some(Action::EditDraft)
         );
+    }
+
+    #[test]
+    fn reservation_comparison_and_extended_query_keys_follow_modal_priority() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('s')), &app),
+            Some(Action::EditReservation)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('v')), &app),
+            Some(Action::CompareVersions)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('l')), &app),
+            Some(Action::EditFields)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('z')), &app),
+            Some(Action::EditDepth)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('i')), &app),
+            Some(Action::EditIds)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('K')), &app),
+            Some(Action::EditDraftKey)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('m')), &app),
+            Some(Action::EditRichEditorFormat)
+        );
+
+        app.reservation_input = Some(crate::app::ReservationInput {
+            content_id: "id".into(),
+            publish_time: String::new(),
+            stop_time: String::new(),
+            publish_cursor: 0,
+            stop_cursor: 0,
+            active_field: crate::app::ReservationField::PublishTime,
+            publication_state: crate::app::ContentPublicationState::Draft,
+        });
+        assert_eq!(
+            action_for_key(key(KeyCode::Tab), &app),
+            Some(Action::ReservationNextField)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::F(8)), &app),
+            Some(Action::ReservationClear)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Delete), &app),
+            Some(Action::ReservationEdit(TextEditAction::Delete))
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Enter), &app),
+            Some(Action::ReservationApply)
+        );
+    }
+
+    #[test]
+    fn input_keymap_supports_terminal_line_editing_shortcuts() {
+        let mut app = App::new(Config::default());
+        app.input_target = Some(crate::app::InputTarget::Search);
+
+        for (code, modifiers, edit) in [
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                TextEditAction::MoveStart,
+            ),
+            (
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                TextEditAction::MoveEnd,
+            ),
+            (
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                TextEditAction::MoveLeft,
+            ),
+            (
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL,
+                TextEditAction::MoveRight,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                TextEditAction::DeleteToStart,
+            ),
+            (
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL,
+                TextEditAction::DeleteToEnd,
+            ),
+            (
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+                TextEditAction::DeletePrevWord,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::ALT,
+                TextEditAction::DeleteNextWord,
+            ),
+            (
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL,
+                TextEditAction::Yank,
+            ),
+        ] {
+            assert_eq!(
+                action_for_key(KeyEvent::new(code, modifiers), &app),
+                Some(Action::InputEdit(edit))
+            );
+        }
+
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('q')), &app),
+            Some(Action::InputChar('q'))
+        );
+    }
+
+    #[test]
+    fn ids_input_uses_the_standard_single_line_apply_key() {
+        let mut app = App::new(Config::default());
+        app.input_target = Some(crate::app::InputTarget::Ids);
+
+        assert_eq!(
+            action_for_key(key(KeyCode::Enter), &app),
+            Some(Action::InputApply)
+        );
+    }
+
+    #[test]
+    fn fields_query_keeps_content_id_for_status_metadata_matching() {
+        assert_eq!(fields_with_content_id(None), None);
+        assert_eq!(
+            fields_with_content_id(Some("title,body")),
+            Some("title,body,id".into())
+        );
+        assert_eq!(
+            fields_with_content_id(Some("title,id")),
+            Some("title,id".into())
+        );
+    }
+
+    #[test]
+    fn query_selector_modal_blocks_browser_keys_and_handles_selection() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.query_selector = Some(crate::app::QuerySelector::Fields {
+            cursor: 0,
+            selected: Default::default(),
+        });
+
+        assert_eq!(
+            action_for_key(key(KeyCode::Char(' ')), &app),
+            Some(Action::QuerySelectorToggle)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('j')), &app),
+            Some(Action::QuerySelectorMoveDown)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Enter), &app),
+            Some(Action::QuerySelectorApply)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Esc), &app),
+            Some(Action::QuerySelectorCancel)
+        );
+        assert_eq!(action_for_key(key(KeyCode::Char('c')), &app), None);
+    }
+
+    #[test]
+    fn schema_fetch_is_skipped_for_cached_endpoint() {
+        let mut app = App::new(Config::default());
+        assert!(should_fetch_schema(&app, Some("blogs")));
+        app.schema_cache
+            .insert("blogs".into(), crate::app::CachedSchema::default());
+        assert!(!should_fetch_schema(&app, Some("blogs")));
+        assert!(!should_fetch_schema(&app, None));
     }
 
     #[test]

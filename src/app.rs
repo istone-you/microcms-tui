@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::{
     config::Config,
     microcms::{
         ApiInfo, ContentCollection, ContentCollectionKind, ContentWriteStatus, PublicationStatus,
+        ReservationTime,
     },
 };
 
@@ -30,7 +32,79 @@ pub enum InputTarget {
     Search,
     Filters,
     Orders,
+    Ids,
+    DraftKey,
     CreateWithId(ContentWriteStatus),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuerySelector {
+    Fields {
+        cursor: usize,
+        selected: HashSet<String>,
+    },
+    Depth {
+        cursor: usize,
+    },
+    RichEditorFormat {
+        cursor: usize,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CachedSchema {
+    pub create_template: Option<Value>,
+    pub field_order: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationField {
+    PublishTime,
+    StopTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEditAction {
+    Backspace,
+    Delete,
+    MoveLeft,
+    MoveRight,
+    MoveStart,
+    MoveEnd,
+    MoveWordLeft,
+    MoveWordRight,
+    DeleteToStart,
+    DeleteToEnd,
+    DeletePrevWord,
+    DeleteNextWord,
+    Transpose,
+    Yank,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationInput {
+    pub content_id: String,
+    pub publish_time: String,
+    pub stop_time: String,
+    pub publish_cursor: usize,
+    pub stop_cursor: usize,
+    pub active_field: ReservationField,
+    pub publication_state: ContentPublicationState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionView {
+    Published,
+    Draft,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionComparison {
+    pub content_id: String,
+    pub published: Value,
+    pub draft: Value,
+    pub view: VersionView,
+    pub scroll: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +139,11 @@ pub enum PendingConfirmation {
         content_ids: Vec<String>,
         status: PublicationStatus,
     },
+    Reservation {
+        content_id: String,
+        publish_time: Option<String>,
+        stop_time: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,15 +168,30 @@ pub struct App {
     pub limit: usize,
     pub total_count: Option<usize>,
     pub content_kind: ContentCollectionKind,
+    pub content_kind_confirmed: bool,
+    pub content_kind_cache: HashMap<String, ContentCollectionKind>,
     pub content_statuses: HashMap<String, ContentPublicationState>,
+    pub draft_keys: HashMap<String, String>,
+    pub reservations: HashMap<String, ReservationTime>,
     pub selected_content_ids: HashSet<String>,
     pub create_template: Option<Value>,
     pub content_field_order: Vec<String>,
+    pub schema_cache: HashMap<String, CachedSchema>,
     pub search_query: Option<String>,
     pub filters: Option<String>,
     pub orders: Option<String>,
+    pub fields: Option<String>,
+    pub depth: Option<u8>,
+    pub ids: Option<String>,
+    pub draft_key: Option<String>,
+    pub rich_editor_format: Option<String>,
     pub input_target: Option<InputTarget>,
     pub input_buffer: String,
+    pub input_cursor: usize,
+    pub input_kill_buffer: String,
+    pub query_selector: Option<QuerySelector>,
+    pub reservation_input: Option<ReservationInput>,
+    pub version_comparison: Option<VersionComparison>,
     pub preview_fullscreen: bool,
     pub preview_scroll: u16,
     pub help_open: bool,
@@ -131,11 +225,34 @@ pub enum Action {
     EditSearch,
     EditFilters,
     EditOrders,
+    EditFields,
+    EditDepth,
+    EditIds,
+    EditDraftKey,
+    EditRichEditorFormat,
+    QuerySelectorMoveDown,
+    QuerySelectorMoveUp,
+    QuerySelectorToggle,
+    QuerySelectorApply,
+    QuerySelectorCancel,
     ClearQuery,
     Publish,
     Draft,
+    EditReservation,
+    ReservationInputChar(char),
+    ReservationEdit(TextEditAction),
+    ReservationNextField,
+    ReservationApply,
+    ReservationClear,
+    ReservationCancel,
+    CompareVersions,
+    CloseVersionComparison,
+    VersionPublished,
+    VersionDraft,
+    VersionScrollDown,
+    VersionScrollUp,
     InputChar(char),
-    InputBackspace,
+    InputEdit(TextEditAction),
     InputApply,
     InputCancel,
     TogglePreviewFullscreen,
@@ -155,6 +272,12 @@ pub enum Command {
     None,
     FetchApis,
     FetchContents,
+    FetchVersions {
+        content_id: String,
+    },
+    FetchReservation {
+        content_id: String,
+    },
     Create {
         template: Value,
         status: ContentWriteStatus,
@@ -183,6 +306,30 @@ pub enum AppEvent {
         create_template: Option<Value>,
         content_field_order: Option<Vec<String>>,
         schema_warning: Option<String>,
+        draft_keys: HashMap<String, String>,
+        reservations: HashMap<String, ReservationTime>,
+    },
+    VersionsLoaded {
+        endpoint: String,
+        content_id: String,
+        published: Value,
+        draft: Value,
+    },
+    VersionsFailed {
+        endpoint: String,
+        content_id: String,
+        error: String,
+    },
+    ReservationLoaded {
+        endpoint: String,
+        content_id: String,
+        reservation: Option<ReservationTime>,
+        publication_state: ContentPublicationState,
+    },
+    ReservationFailed {
+        endpoint: String,
+        content_id: String,
+        error: String,
     },
     FetchFailed {
         endpoint: Option<String>,
@@ -229,15 +376,30 @@ impl App {
             limit: PAGE_LIMIT,
             total_count: None,
             content_kind: ContentCollectionKind::List,
+            content_kind_confirmed: false,
+            content_kind_cache: HashMap::new(),
             content_statuses: HashMap::new(),
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
             selected_content_ids: HashSet::new(),
             create_template: None,
             content_field_order: Vec::new(),
+            schema_cache: HashMap::new(),
             search_query: None,
             filters: None,
             orders: None,
+            fields: None,
+            depth: None,
+            ids: None,
+            draft_key: None,
+            rich_editor_format: None,
             input_target: None,
             input_buffer: String::new(),
+            input_cursor: 0,
+            input_kill_buffer: String::new(),
+            query_selector: None,
+            reservation_input: None,
+            version_comparison: None,
             preview_fullscreen: false,
             preview_scroll: 0,
             help_open: false,
@@ -260,6 +422,11 @@ impl App {
                     self.close_preview();
                     self.screen = Screen::EndpointPicker;
                     self.state = LoadState::ApisLoaded;
+                    self.reset_query_values();
+                    self.input_target = None;
+                    self.input_buffer.clear();
+                    self.input_cursor = 0;
+                    self.query_selector = None;
                     self.pending_confirmation = None;
                     self.selected_content_ids.clear();
                     self.message = None;
@@ -309,6 +476,9 @@ impl App {
                     if let Some(api) = self.apis.get(self.api_selected) {
                         self.help_open = false;
                         let endpoint = api.endpoint.clone();
+                        let endpoint_changed = self.endpoint.as_deref() != Some(endpoint.as_str());
+                        let cached_schema = self.schema_cache.get(&endpoint).cloned();
+                        let cached_kind = self.content_kind_cache.get(&endpoint).copied();
                         self.close_preview();
                         self.endpoint = Some(endpoint);
                         self.screen = Screen::ContentBrowser;
@@ -317,9 +487,21 @@ impl App {
                         self.items.clear();
                         self.content_selected = 0;
                         self.total_count = None;
-                        self.content_kind = ContentCollectionKind::List;
-                        self.create_template = None;
-                        self.content_field_order.clear();
+                        self.content_kind = cached_kind.unwrap_or(ContentCollectionKind::List);
+                        self.content_kind_confirmed = cached_kind.is_some();
+                        self.content_statuses.clear();
+                        self.draft_keys.clear();
+                        self.reservations.clear();
+                        self.create_template = cached_schema
+                            .as_ref()
+                            .and_then(|schema| schema.create_template.clone());
+                        self.content_field_order = cached_schema
+                            .map(|schema| schema.field_order)
+                            .unwrap_or_default();
+                        if endpoint_changed {
+                            self.fields = None;
+                        }
+                        self.query_selector = None;
                         self.selected_content_ids.clear();
                         self.pending_confirmation = None;
                         self.state = LoadState::LoadingContents;
@@ -336,6 +518,8 @@ impl App {
                     ) =>
                 {
                     self.help_open = false;
+                    self.schema_cache.clear();
+                    self.content_kind_cache.clear();
                     self.state = LoadState::LoadingApis;
                     self.message = None;
                     return Command::FetchApis;
@@ -513,13 +697,120 @@ impl App {
             Action::EditOrders if self.screen == Screen::ContentBrowser => {
                 self.begin_input(InputTarget::Orders);
             }
+            Action::EditFields if self.screen == Screen::ContentBrowser => {
+                if self.content_field_order.is_empty() {
+                    self.message = Some("Schema unavailable; cannot select fields.".into());
+                } else {
+                    let available: HashSet<&str> = self
+                        .content_field_order
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    let selected = self
+                        .fields
+                        .as_deref()
+                        .into_iter()
+                        .flat_map(|fields| fields.split(','))
+                        .map(str::trim)
+                        .filter(|field| available.contains(*field))
+                        .map(str::to_string)
+                        .collect();
+                    self.query_selector = Some(QuerySelector::Fields {
+                        cursor: 0,
+                        selected,
+                    });
+                    self.message = None;
+                }
+            }
+            Action::EditDepth if self.screen == Screen::ContentBrowser => {
+                self.query_selector = Some(QuerySelector::Depth {
+                    cursor: self.depth.map_or(0, |depth| depth as usize + 1),
+                });
+            }
+            Action::EditIds if self.screen == Screen::ContentBrowser => {
+                self.begin_input(InputTarget::Ids);
+            }
+            Action::EditDraftKey if self.screen == Screen::ContentBrowser => {
+                self.begin_input(InputTarget::DraftKey);
+            }
+            Action::EditRichEditorFormat if self.screen == Screen::ContentBrowser => {
+                self.query_selector = Some(QuerySelector::RichEditorFormat {
+                    cursor: match self.rich_editor_format.as_deref() {
+                        Some("html") => 1,
+                        Some("object") => 2,
+                        _ => 0,
+                    },
+                });
+            }
+            Action::QuerySelectorMoveDown => {
+                if let Some(selector) = self.query_selector.as_mut() {
+                    let (cursor, maximum) = match selector {
+                        QuerySelector::Fields { cursor, .. } => {
+                            (cursor, self.content_field_order.len().saturating_sub(1))
+                        }
+                        QuerySelector::Depth { cursor } => (cursor, 4),
+                        QuerySelector::RichEditorFormat { cursor } => (cursor, 2),
+                    };
+                    *cursor = (*cursor + 1).min(maximum);
+                }
+            }
+            Action::QuerySelectorMoveUp => {
+                if let Some(selector) = self.query_selector.as_mut() {
+                    let cursor = match selector {
+                        QuerySelector::Fields { cursor, .. }
+                        | QuerySelector::Depth { cursor }
+                        | QuerySelector::RichEditorFormat { cursor } => cursor,
+                    };
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            Action::QuerySelectorToggle => {
+                if let Some(QuerySelector::Fields { cursor, selected }) =
+                    self.query_selector.as_mut()
+                {
+                    if let Some(field) = self.content_field_order.get(*cursor) {
+                        if !selected.remove(field) {
+                            selected.insert(field.clone());
+                        }
+                    }
+                }
+            }
+            Action::QuerySelectorApply => {
+                if let Some(selector) = self.query_selector.take() {
+                    match selector {
+                        QuerySelector::Fields { selected, .. } => {
+                            let fields = self
+                                .content_field_order
+                                .iter()
+                                .filter(|field| selected.contains(*field))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            self.fields = (!fields.is_empty()).then_some(fields);
+                        }
+                        QuerySelector::Depth { cursor } => {
+                            self.depth = (cursor > 0).then_some((cursor - 1) as u8);
+                        }
+                        QuerySelector::RichEditorFormat { cursor } => {
+                            self.rich_editor_format = match cursor {
+                                1 => Some("html".into()),
+                                2 => Some("object".into()),
+                                _ => None,
+                            };
+                        }
+                    }
+                    return self.reload_after_query_change();
+                }
+            }
+            Action::QuerySelectorCancel => {
+                self.query_selector = None;
+            }
             Action::ClearQuery if self.screen == Screen::ContentBrowser => {
                 self.help_open = false;
                 self.close_preview();
-                self.search_query = None;
-                self.filters = None;
-                self.orders = None;
+                self.reset_query_values();
                 self.offset = 0;
+                self.limit = PAGE_LIMIT;
                 self.selected_content_ids.clear();
                 self.pending_confirmation = None;
                 self.state = LoadState::LoadingContents;
@@ -532,20 +823,130 @@ impl App {
             Action::Draft if self.screen == Screen::ContentBrowser => {
                 return self.publication_status_command(PublicationStatus::Draft);
             }
-            Action::InputChar(character) => {
-                if self.input_target.is_some() {
-                    self.input_buffer.push(character);
+            Action::EditReservation => {
+                if self.is_object_api() {
+                    self.message =
+                        Some("Object API publication reservations are not supported.".into());
+                    return Command::None;
+                }
+                let Some(content_id) = self.selected_content_id() else {
+                    self.message =
+                        Some("Selected content has no id or _id; cannot edit reservation.".into());
+                    return Command::None;
+                };
+                self.message = Some("Loading current publication reservation...".into());
+                return Command::FetchReservation { content_id };
+            }
+            Action::ReservationInputChar(character) => {
+                if let Some(input) = self.reservation_input.as_mut() {
+                    let (buffer, cursor) = reservation_active_parts(input);
+                    insert_char_at(buffer, cursor, character);
                 }
             }
-            Action::InputBackspace => {
+            Action::ReservationEdit(action) => {
+                let kill_buffer = &mut self.input_kill_buffer;
+                if let Some(input) = self.reservation_input.as_mut() {
+                    let (buffer, cursor) = reservation_active_parts(input);
+                    apply_text_edit(buffer, cursor, action, kill_buffer);
+                }
+            }
+            Action::ReservationNextField => {
+                if let Some(input) = self.reservation_input.as_mut() {
+                    input.active_field = match input.active_field {
+                        ReservationField::PublishTime => ReservationField::StopTime,
+                        ReservationField::StopTime => ReservationField::PublishTime,
+                    };
+                }
+            }
+            Action::ReservationApply => {
+                if let Some(input) = self.reservation_input.take() {
+                    match reservation_payload(
+                        &input.publish_time,
+                        &input.stop_time,
+                        input.publication_state,
+                    ) {
+                        Ok(Some((publish_time, stop_time))) => {
+                            self.pending_confirmation = Some(PendingConfirmation::Reservation {
+                                content_id: input.content_id,
+                                publish_time,
+                                stop_time,
+                            });
+                            self.message = Some("Confirm publication reservation.".into());
+                        }
+                        Ok(None) => {
+                            self.reservation_input = Some(input);
+                            self.message = Some(
+                                "Enter a publish time or stop time, or press F8 to clear the reservation."
+                                    .into(),
+                            );
+                        }
+                        Err(error) => {
+                            self.reservation_input = Some(input);
+                            self.message = Some(format!("error: {error}"));
+                        }
+                    }
+                }
+            }
+            Action::ReservationClear => {
+                if let Some(input) = self.reservation_input.take() {
+                    self.pending_confirmation = Some(PendingConfirmation::Reservation {
+                        content_id: input.content_id,
+                        publish_time: None,
+                        stop_time: None,
+                    });
+                    self.message = Some("Confirm publication reservation removal.".into());
+                }
+            }
+            Action::ReservationCancel => {
+                self.reservation_input = None;
+                self.message = Some("Reservation edit cancelled.".into());
+            }
+            Action::CompareVersions => {
+                if self.is_object_api() {
+                    self.message = Some("Object API version comparison is not supported.".into());
+                    return Command::None;
+                }
+                let Some(content_id) = self.selected_content_id() else {
+                    self.message =
+                        Some("Selected content has no id or _id; cannot compare versions.".into());
+                    return Command::None;
+                };
+                self.message = Some("Loading published and draft versions...".into());
+                return Command::FetchVersions { content_id };
+            }
+            Action::CloseVersionComparison => self.version_comparison = None,
+            Action::VersionPublished => self.set_version_view(VersionView::Published),
+            Action::VersionDraft => self.set_version_view(VersionView::Draft),
+            Action::VersionScrollDown => {
+                if let Some(comparison) = self.version_comparison.as_mut() {
+                    comparison.scroll = comparison.scroll.saturating_add(1);
+                }
+            }
+            Action::VersionScrollUp => {
+                if let Some(comparison) = self.version_comparison.as_mut() {
+                    comparison.scroll = comparison.scroll.saturating_sub(1);
+                }
+            }
+            Action::InputChar(character) => {
                 if self.input_target.is_some() {
-                    self.input_buffer.pop();
+                    insert_char_at(&mut self.input_buffer, &mut self.input_cursor, character);
+                }
+            }
+            Action::InputEdit(action) => {
+                if self.input_target.is_some() {
+                    apply_text_edit(
+                        &mut self.input_buffer,
+                        &mut self.input_cursor,
+                        action,
+                        &mut self.input_kill_buffer,
+                    );
                 }
             }
             Action::InputApply => {
                 if let Some(target) = self.input_target.take() {
                     let input = self.input_buffer.trim().to_string();
                     self.input_buffer.clear();
+                    self.input_cursor = 0;
                     if let InputTarget::CreateWithId(status) = target {
                         if self.is_object_api() {
                             self.message =
@@ -567,30 +968,35 @@ impl App {
                         self.message = Some("Schema unavailable; cannot create content.".into());
                         return Command::None;
                     }
-                    let value = (!input.is_empty()).then_some(input);
+                    let value = (!input.is_empty()).then_some(input.clone());
                     match target {
                         InputTarget::Search => self.search_query = value,
                         InputTarget::Filters => self.filters = value,
                         InputTarget::Orders => self.orders = value,
+                        InputTarget::Ids => {
+                            let ids = normalize_ids(&input);
+                            self.ids = (!ids.is_empty()).then_some(ids);
+                        }
+                        InputTarget::DraftKey => self.draft_key = value,
                         InputTarget::CreateWithId(_) => unreachable!(),
                     }
-                    self.offset = 0;
-                    self.help_open = false;
-                    self.close_preview();
-                    self.pending_confirmation = None;
-                    self.selected_content_ids.clear();
-                    self.message = None;
-                    self.state = LoadState::LoadingContents;
-                    return Command::FetchContents;
+                    return self.reload_after_query_change();
                 }
             }
             Action::InputCancel => {
                 self.input_target = None;
                 self.input_buffer.clear();
+                self.input_cursor = 0;
+                self.query_selector = None;
             }
             Action::EditSearch
             | Action::EditFilters
             | Action::EditOrders
+            | Action::EditFields
+            | Action::EditDepth
+            | Action::EditIds
+            | Action::EditDraftKey
+            | Action::EditRichEditorFormat
             | Action::ClearQuery
             | Action::Publish
             | Action::Draft => {}
@@ -619,6 +1025,8 @@ impl App {
                 create_template,
                 content_field_order,
                 schema_warning,
+                draft_keys,
+                reservations,
             } => {
                 if !self.accepts_contents_event(&endpoint) {
                     return Command::None;
@@ -627,19 +1035,37 @@ impl App {
                 self.close_preview();
                 self.input_target = None;
                 self.input_buffer.clear();
+                self.input_cursor = 0;
+                self.query_selector = None;
                 let is_object = collection.kind == ContentCollectionKind::Object;
                 self.content_kind = collection.kind;
+                self.content_kind_confirmed = true;
+                self.content_kind_cache
+                    .insert(endpoint.clone(), collection.kind);
                 self.offset = collection.offset;
                 self.limit = collection.limit;
                 self.total_count = Some(collection.total_count);
                 self.items = collection.contents;
                 self.content_statuses = if is_object { HashMap::new() } else { statuses };
+                self.draft_keys = if is_object {
+                    HashMap::new()
+                } else {
+                    draft_keys
+                };
+                self.reservations = if is_object {
+                    HashMap::new()
+                } else {
+                    reservations
+                };
                 self.selected_content_ids.clear();
                 self.pending_confirmation = None;
-                if let Some(template) = create_template {
-                    self.create_template = Some(template);
-                }
                 if let Some(field_order) = content_field_order {
+                    let cached = CachedSchema {
+                        create_template: create_template.clone(),
+                        field_order: field_order.clone(),
+                    };
+                    self.schema_cache.insert(endpoint.clone(), cached);
+                    self.create_template = create_template;
                     self.content_field_order = field_order;
                 }
                 self.content_selected = 0;
@@ -657,6 +1083,93 @@ impl App {
                         None => warning,
                     });
                 }
+            }
+            AppEvent::VersionsLoaded {
+                endpoint,
+                content_id,
+                published,
+                draft,
+            } => {
+                if !self.accepts_mutation_event(&endpoint)
+                    || self.selected_content_id().as_deref() != Some(content_id.as_str())
+                {
+                    return Command::None;
+                }
+                self.version_comparison = Some(VersionComparison {
+                    content_id,
+                    published,
+                    draft,
+                    view: VersionView::Draft,
+                    scroll: 0,
+                });
+                self.message = Some("Published and draft versions loaded.".into());
+            }
+            AppEvent::VersionsFailed {
+                endpoint,
+                content_id,
+                error,
+            } => {
+                if !self.accepts_mutation_event(&endpoint)
+                    || self.selected_content_id().as_deref() != Some(content_id.as_str())
+                {
+                    return Command::None;
+                }
+                self.message = Some(format!("error: {error}"));
+            }
+            AppEvent::ReservationLoaded {
+                endpoint,
+                content_id,
+                reservation,
+                publication_state,
+            } => {
+                if !self.accepts_mutation_event(&endpoint)
+                    || self.selected_content_id().as_deref() != Some(content_id.as_str())
+                {
+                    return Command::None;
+                }
+                let current = reservation.unwrap_or_default();
+                if current.publish_time.is_some() || current.stop_time.is_some() {
+                    self.reservations
+                        .insert(content_id.clone(), current.clone());
+                } else {
+                    self.reservations.remove(&content_id);
+                }
+                let publish_time = current
+                    .publish_time
+                    .as_deref()
+                    .and_then(reservation_time_for_input)
+                    .unwrap_or_default();
+                let stop_time = current
+                    .stop_time
+                    .as_deref()
+                    .and_then(reservation_time_for_input)
+                    .unwrap_or_default();
+                self.reservation_input = Some(ReservationInput {
+                    content_id,
+                    publish_cursor: publish_time.chars().count(),
+                    stop_cursor: stop_time.chars().count(),
+                    publish_time,
+                    stop_time,
+                    active_field: if publication_state == ContentPublicationState::Published {
+                        ReservationField::StopTime
+                    } else {
+                        ReservationField::PublishTime
+                    },
+                    publication_state,
+                });
+                self.message = None;
+            }
+            AppEvent::ReservationFailed {
+                endpoint,
+                content_id,
+                error,
+            } => {
+                if !self.accepts_mutation_event(&endpoint)
+                    || self.selected_content_id().as_deref() != Some(content_id.as_str())
+                {
+                    return Command::None;
+                }
+                self.message = Some(format!("error: {error}"));
             }
             AppEvent::FetchFailed { endpoint, error } => {
                 let should_apply = match endpoint.as_deref() {
@@ -757,6 +1270,8 @@ impl App {
     fn close_preview(&mut self) {
         self.preview_fullscreen = false;
         self.preview_scroll = 0;
+        self.version_comparison = None;
+        self.reservation_input = None;
     }
 
     fn selected_content_id(&self) -> Option<String> {
@@ -822,10 +1337,43 @@ impl App {
             InputTarget::Search => self.search_query.clone(),
             InputTarget::Filters => self.filters.clone(),
             InputTarget::Orders => self.orders.clone(),
+            InputTarget::Ids => self.ids.clone(),
+            InputTarget::DraftKey => self.draft_key.clone(),
             InputTarget::CreateWithId(_) => None,
         }
         .unwrap_or_default();
+        self.input_cursor = self.input_buffer.chars().count();
         self.input_target = Some(target);
+    }
+
+    fn reload_after_query_change(&mut self) -> Command {
+        self.offset = 0;
+        self.limit = PAGE_LIMIT;
+        self.help_open = false;
+        self.close_preview();
+        self.pending_confirmation = None;
+        self.selected_content_ids.clear();
+        self.message = None;
+        self.state = LoadState::LoadingContents;
+        Command::FetchContents
+    }
+
+    fn reset_query_values(&mut self) {
+        self.search_query = None;
+        self.filters = None;
+        self.orders = None;
+        self.fields = None;
+        self.depth = None;
+        self.ids = None;
+        self.draft_key = None;
+        self.rich_editor_format = None;
+    }
+
+    fn set_version_view(&mut self, view: VersionView) {
+        if let Some(comparison) = self.version_comparison.as_mut() {
+            comparison.view = view;
+            comparison.scroll = 0;
+        }
     }
 
     pub fn publication_state_for(&self, value: &Value) -> ContentPublicationState {
@@ -834,6 +1382,205 @@ impl App {
             .copied()
             .unwrap_or(ContentPublicationState::Unknown)
     }
+
+    pub fn reservation_for(&self, value: &Value) -> Option<&ReservationTime> {
+        content_id(value).and_then(|id| self.reservations.get(id))
+    }
+}
+
+pub fn normalize_ids(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn reservation_active_parts(input: &mut ReservationInput) -> (&mut String, &mut usize) {
+    match input.active_field {
+        ReservationField::PublishTime => (&mut input.publish_time, &mut input.publish_cursor),
+        ReservationField::StopTime => (&mut input.stop_time, &mut input.stop_cursor),
+    }
+}
+
+fn byte_index(value: &str, character_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(character_index)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
+fn insert_char_at(value: &mut String, cursor: &mut usize, character: char) {
+    let position = byte_index(value, *cursor);
+    value.insert(position, character);
+    *cursor += 1;
+}
+
+fn word_left(chars: &[char], mut cursor: usize) -> usize {
+    while cursor > 0 && chars[cursor - 1].is_whitespace() {
+        cursor -= 1;
+    }
+    while cursor > 0 && !chars[cursor - 1].is_whitespace() {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn word_right(chars: &[char], mut cursor: usize) -> usize {
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    while cursor < chars.len() && !chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn drain_chars(value: &mut String, start: usize, end: usize) -> String {
+    let start_byte = byte_index(value, start);
+    let end_byte = byte_index(value, end);
+    value.drain(start_byte..end_byte).collect()
+}
+
+fn apply_text_edit(
+    value: &mut String,
+    cursor: &mut usize,
+    action: TextEditAction,
+    kill_buffer: &mut String,
+) {
+    let length = value.chars().count();
+    *cursor = (*cursor).min(length);
+    match action {
+        TextEditAction::Backspace if *cursor > 0 => {
+            drain_chars(value, *cursor - 1, *cursor);
+            *cursor -= 1;
+        }
+        TextEditAction::Delete if *cursor < length => {
+            drain_chars(value, *cursor, *cursor + 1);
+        }
+        TextEditAction::MoveLeft => *cursor = cursor.saturating_sub(1),
+        TextEditAction::MoveRight => *cursor = (*cursor + 1).min(length),
+        TextEditAction::MoveStart => *cursor = 0,
+        TextEditAction::MoveEnd => *cursor = length,
+        TextEditAction::MoveWordLeft => {
+            *cursor = word_left(&value.chars().collect::<Vec<_>>(), *cursor)
+        }
+        TextEditAction::MoveWordRight => {
+            *cursor = word_right(&value.chars().collect::<Vec<_>>(), *cursor)
+        }
+        TextEditAction::DeleteToStart if *cursor > 0 => {
+            *kill_buffer = drain_chars(value, 0, *cursor);
+            *cursor = 0;
+        }
+        TextEditAction::DeleteToEnd if *cursor < length => {
+            *kill_buffer = drain_chars(value, *cursor, length);
+        }
+        TextEditAction::DeletePrevWord if *cursor > 0 => {
+            let start = word_left(&value.chars().collect::<Vec<_>>(), *cursor);
+            *kill_buffer = drain_chars(value, start, *cursor);
+            *cursor = start;
+        }
+        TextEditAction::DeleteNextWord if *cursor < length => {
+            let end = word_right(&value.chars().collect::<Vec<_>>(), *cursor);
+            *kill_buffer = drain_chars(value, *cursor, end);
+        }
+        TextEditAction::Transpose if length >= 2 && *cursor > 0 => {
+            let mut chars: Vec<char> = value.chars().collect();
+            let left = if *cursor == length {
+                length - 2
+            } else {
+                *cursor - 1
+            };
+            chars.swap(left, left + 1);
+            *value = chars.into_iter().collect();
+            if *cursor < length {
+                *cursor += 1;
+            }
+        }
+        TextEditAction::Yank if !kill_buffer.is_empty() => {
+            let position = byte_index(value, *cursor);
+            value.insert_str(position, kill_buffer);
+            *cursor += kill_buffer.chars().count();
+        }
+        _ => {}
+    }
+}
+
+pub fn reservation_payload(
+    publish_time: &str,
+    stop_time: &str,
+    publication_state: ContentPublicationState,
+) -> Result<Option<(Option<String>, Option<String>)>, String> {
+    let publish = parse_reservation_datetime(publish_time)?;
+    let stop = parse_reservation_datetime(stop_time)?;
+    if publish.is_none() && stop.is_none() {
+        return Ok(None);
+    }
+    if publish.is_some()
+        && stop.is_none()
+        && publication_state == ContentPublicationState::Published
+    {
+        return Err(
+            "Published content cannot have only a publish reservation; set a stop time first."
+                .into(),
+        );
+    }
+    if publish.is_none()
+        && stop.is_some()
+        && matches!(
+            publication_state,
+            ContentPublicationState::Draft | ContentPublicationState::Closed
+        )
+    {
+        return Err(
+            "Draft or closed content cannot have only a stop reservation; set a publish time."
+                .into(),
+        );
+    }
+    if let (Some(publish), Some(stop)) = (&publish, &stop) {
+        let publish_date = DateTime::parse_from_rfc3339(publish)
+            .map_err(|_| "invalid publish time".to_string())?;
+        let stop_date =
+            DateTime::parse_from_rfc3339(stop).map_err(|_| "invalid stop time".to_string())?;
+        if publication_state == ContentPublicationState::Published {
+            if publish_date <= stop_date {
+                return Err(
+                    "For published content, stop time must be before the next publish time.".into(),
+                );
+            }
+        } else if stop_date < publish_date {
+            return Err("Stop time must not be before publish time.".into());
+        }
+    }
+    Ok(Some((publish, stop)))
+}
+
+fn parse_reservation_datetime(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(date_time) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(date_time.with_timezone(&Utc).to_rfc3339()));
+    }
+    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M")
+        .map_err(|_| "Date/time must use YYYY-MM-DD HH:MM or ISO 8601.".to_string())?;
+    let local = Local
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| "Date/time is ambiguous or invalid in the local time zone.".to_string())?;
+    Ok(Some(local.with_timezone(&Utc).to_rfc3339()))
+}
+
+fn reservation_time_for_input(value: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(value).ok().map(|date_time| {
+        date_time
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
 }
 
 pub fn content_id(value: &Value) -> Option<&str> {
@@ -1180,6 +1927,8 @@ mod tests {
             create_template: None,
             content_field_order: None,
             schema_warning: None,
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
         }
     }
 
@@ -1801,6 +2550,8 @@ mod tests {
             create_template: None,
             content_field_order: None,
             schema_warning: None,
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
         });
         assert!(!app.preview_fullscreen);
 
@@ -2047,6 +2798,8 @@ mod tests {
             create_template: None,
             content_field_order: None,
             schema_warning: None,
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
         });
 
         assert_eq!(
@@ -2111,9 +2864,15 @@ mod tests {
             create_template: Some(json!({"body": ""})),
             content_field_order: Some(vec!["body".into()]),
             schema_warning: None,
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
         });
 
         assert_eq!(app.content_kind, ContentCollectionKind::Object);
+        assert_eq!(
+            app.schema_cache["object-endpoint"].field_order,
+            vec!["body".to_string()]
+        );
         assert!(app.content_statuses.is_empty());
         for action in [
             Action::NextPage,
@@ -2128,11 +2887,15 @@ mod tests {
             Action::DeleteRequest,
             Action::Publish,
             Action::Draft,
+            Action::EditReservation,
+            Action::CompareVersions,
         ] {
             assert_eq!(app.apply_action(action), Command::None, "{action:?}");
             assert!(app.selected_content_ids.is_empty(), "{action:?}");
             assert!(app.pending_confirmation.is_none(), "{action:?}");
             assert_eq!(app.input_target, None, "{action:?}");
+            assert!(app.reservation_input.is_none(), "{action:?}");
+            assert!(app.version_comparison.is_none(), "{action:?}");
         }
 
         assert_eq!(
@@ -2162,6 +2925,8 @@ mod tests {
             create_template: None,
             content_field_order: None,
             schema_warning: None,
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
         });
         assert_eq!(app.limit, 1);
         assert_eq!(app.content_kind, ContentCollectionKind::Object);
@@ -2179,6 +2944,46 @@ mod tests {
         assert_eq!(app.offset, 0);
         assert_eq!(app.content_kind, ContentCollectionKind::List);
         assert!(app.items.is_empty());
+    }
+
+    #[test]
+    fn back_clears_queries_and_reselecting_endpoint_reuses_confirmed_list_kind() {
+        let mut app = App::new(credentials_only_config());
+        app.endpoint = Some("blogs".into());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.content_kind = ContentCollectionKind::List;
+        app.content_kind_confirmed = true;
+        app.content_kind_cache
+            .insert("blogs".into(), ContentCollectionKind::List);
+        app.search_query = Some("term".into());
+        app.filters = Some("title[exists]".into());
+        app.orders = Some("-publishedAt".into());
+        app.fields = Some("title".into());
+        app.depth = Some(2);
+        app.ids = Some("one,two".into());
+        app.draft_key = Some("draft-key".into());
+        app.rich_editor_format = Some("object".into());
+
+        assert_eq!(app.apply_action(Action::Back), Command::None);
+        assert_eq!(app.search_query, None);
+        assert_eq!(app.filters, None);
+        assert_eq!(app.orders, None);
+        assert_eq!(app.fields, None);
+        assert_eq!(app.depth, None);
+        assert_eq!(app.ids, None);
+        assert_eq!(app.draft_key, None);
+        assert_eq!(app.rich_editor_format, None);
+
+        app.apis = vec![ApiInfo {
+            endpoint: "blogs".into(),
+            name: None,
+            description: None,
+        }];
+        app.api_selected = 0;
+        assert_eq!(app.apply_action(Action::Select), Command::FetchContents);
+        assert_eq!(app.content_kind, ContentCollectionKind::List);
+        assert!(app.content_kind_confirmed);
     }
 
     #[test]
@@ -2213,6 +3018,8 @@ mod tests {
             create_template: Some(json!({"stale": ""})),
             content_field_order: Some(vec!["stale".into()]),
             schema_warning: Some("stale schema warning".into()),
+            draft_keys: HashMap::new(),
+            reservations: HashMap::new(),
         };
 
         assert_eq!(app.apply_event(stale_event), Command::None);
@@ -2246,6 +3053,8 @@ mod tests {
                 create_template: Some(json!({"fresh": ""})),
                 content_field_order: Some(vec!["fresh".into()]),
                 schema_warning: None,
+                draft_keys: HashMap::new(),
+                reservations: HashMap::new(),
             }),
             Command::None
         );
@@ -2423,5 +3232,353 @@ mod tests {
             Command::None
         );
         assert_eq!(app.message.as_deref(), Some("error: request failed"));
+    }
+
+    #[test]
+    fn reservation_payload_validates_and_converts_official_time_shapes() {
+        assert_eq!(
+            reservation_payload("", "", ContentPublicationState::Draft).unwrap(),
+            None
+        );
+        assert_eq!(
+            reservation_payload(
+                "2026-08-01T09:00:00+09:00",
+                "",
+                ContentPublicationState::Draft,
+            )
+            .unwrap()
+            .unwrap(),
+            (Some("2026-08-01T00:00:00+00:00".into()), None)
+        );
+        assert!(reservation_payload("not a date", "", ContentPublicationState::Draft).is_err());
+        assert!(reservation_payload(
+            "2026-08-31T23:59:00+09:00",
+            "2026-08-01T09:00:00+09:00",
+            ContentPublicationState::Draft,
+        )
+        .is_err());
+        assert!(reservation_payload(
+            "2026-08-01T09:00:00+09:00",
+            "",
+            ContentPublicationState::Published,
+        )
+        .is_err());
+        assert!(reservation_payload(
+            "",
+            "2026-08-31T23:59:00+09:00",
+            ContentPublicationState::Draft,
+        )
+        .is_err());
+        assert!(reservation_payload(
+            "2026-08-31T23:59:00+09:00",
+            "2026-08-01T09:00:00+09:00",
+            ContentPublicationState::Published,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reservation_editor_prefills_current_metadata_and_requires_confirmation() {
+        let mut app = App::new(Config::default());
+        app.endpoint = Some("blogs".into());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.items = vec![json!({"id": "id1", "title": "Post"})];
+        app.reservations.insert(
+            "id1".into(),
+            ReservationTime {
+                publish_time: Some("2026-08-01T00:00:00Z".into()),
+                stop_time: Some("2026-08-31T14:59:00Z".into()),
+            },
+        );
+
+        assert_eq!(
+            app.apply_action(Action::EditReservation),
+            Command::FetchReservation {
+                content_id: "id1".into()
+            }
+        );
+        app.apply_event(AppEvent::ReservationLoaded {
+            endpoint: app.endpoint.clone().unwrap_or_default(),
+            content_id: "id1".into(),
+            reservation: app.reservations.get("id1").cloned(),
+            publication_state: ContentPublicationState::Draft,
+        });
+        let input = app.reservation_input.as_ref().unwrap();
+        assert!(!input.publish_time.is_empty());
+        assert!(!input.stop_time.is_empty());
+
+        assert_eq!(app.apply_action(Action::ReservationApply), Command::None);
+        assert!(matches!(
+            app.pending_confirmation,
+            Some(PendingConfirmation::Reservation {
+                ref content_id,
+                publish_time: Some(_),
+                stop_time: Some(_),
+            }) if content_id == "id1"
+        ));
+    }
+
+    #[test]
+    fn version_comparison_requires_draft_key_and_loads_views() {
+        let mut app = App::new(Config::default());
+        app.endpoint = Some("blogs".into());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.items = vec![json!({"id": "id1", "title": "Published"})];
+
+        assert_eq!(
+            app.apply_action(Action::CompareVersions),
+            Command::FetchVersions {
+                content_id: "id1".into(),
+            }
+        );
+        app.apply_event(AppEvent::VersionsFailed {
+            endpoint: "blogs".into(),
+            content_id: "id1".into(),
+            error: "Selected content has no draftKey; no draft version is available.".into(),
+        });
+        assert!(app.message.as_deref().unwrap().contains("no draftKey"));
+        app.apply_event(AppEvent::VersionsLoaded {
+            endpoint: "blogs".into(),
+            content_id: "id1".into(),
+            published: json!({"id": "id1", "title": "Published"}),
+            draft: json!({"id": "id1", "title": "Draft"}),
+        });
+        assert_eq!(
+            app.version_comparison.as_ref().unwrap().view,
+            VersionView::Draft
+        );
+        app.apply_action(Action::VersionPublished);
+        assert_eq!(
+            app.version_comparison.as_ref().unwrap().view,
+            VersionView::Published
+        );
+        app.apply_action(Action::CloseVersionComparison);
+        assert!(app.version_comparison.is_none());
+    }
+
+    #[test]
+    fn extended_query_inputs_apply_and_clear_with_existing_queries() {
+        let mut app = App::new(Config::default());
+        app.endpoint = Some("blogs".into());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+
+        app.content_field_order = vec!["title".into(), "body".into(), "eyecatch".into()];
+
+        app.apply_action(Action::EditDepth);
+        for _ in 0..4 {
+            app.apply_action(Action::QuerySelectorMoveDown);
+        }
+        assert_eq!(
+            app.apply_action(Action::QuerySelectorApply),
+            Command::FetchContents
+        );
+        assert_eq!(app.depth, Some(3));
+
+        app.state = LoadState::ContentsLoaded;
+        app.apply_action(Action::EditFields);
+        app.apply_action(Action::QuerySelectorToggle);
+        app.apply_action(Action::QuerySelectorMoveDown);
+        app.apply_action(Action::QuerySelectorToggle);
+        assert_eq!(
+            app.apply_action(Action::QuerySelectorApply),
+            Command::FetchContents
+        );
+        assert_eq!(app.fields.as_deref(), Some("title,body"));
+
+        app.state = LoadState::ContentsLoaded;
+        app.apply_action(Action::EditIds);
+        app.input_buffer = " first-id, second-id, third-id ".into();
+        assert_eq!(app.apply_action(Action::InputApply), Command::FetchContents);
+        assert_eq!(app.ids.as_deref(), Some("first-id,second-id,third-id"));
+
+        app.state = LoadState::ContentsLoaded;
+        assert_eq!(app.apply_action(Action::ClearQuery), Command::FetchContents);
+        assert_eq!(app.depth, None);
+        assert_eq!(app.fields, None);
+        assert_eq!(app.search_query, None);
+    }
+
+    #[test]
+    fn every_query_apply_and_clear_restores_page_limit_after_single_result() {
+        let mut app = App::new(Config::default());
+        app.endpoint = Some("blogs".into());
+        app.screen = Screen::ContentBrowser;
+        app.content_field_order = vec!["title".into()];
+
+        for (action, input) in [
+            (Action::EditSearch, "word"),
+            (Action::EditFilters, "title[exists]"),
+            (Action::EditOrders, "-publishedAt"),
+            (Action::EditIds, "content-id"),
+            (Action::EditDraftKey, "draft-key"),
+        ] {
+            app.state = LoadState::ContentsLoaded;
+            app.limit = 1;
+            app.apply_action(action);
+            app.input_buffer = input.into();
+            assert_eq!(app.apply_action(Action::InputApply), Command::FetchContents);
+            assert_eq!(app.limit, PAGE_LIMIT, "{action:?}");
+        }
+
+        for action in [
+            Action::EditFields,
+            Action::EditDepth,
+            Action::EditRichEditorFormat,
+        ] {
+            app.state = LoadState::ContentsLoaded;
+            app.limit = 1;
+            app.apply_action(action);
+            if action != Action::EditFields {
+                app.apply_action(Action::QuerySelectorMoveDown);
+            } else {
+                app.apply_action(Action::QuerySelectorToggle);
+            }
+            assert_eq!(
+                app.apply_action(Action::QuerySelectorApply),
+                Command::FetchContents
+            );
+            assert_eq!(app.limit, PAGE_LIMIT, "{action:?}");
+        }
+
+        app.state = LoadState::ContentsLoaded;
+        app.limit = 1;
+        assert_eq!(app.apply_action(Action::ClearQuery), Command::FetchContents);
+        assert_eq!(app.limit, PAGE_LIMIT);
+    }
+
+    #[test]
+    fn input_editor_supports_cursor_unicode_kill_and_yank() {
+        let mut app = App::new(Config::default());
+        app.input_target = Some(InputTarget::Search);
+        app.input_buffer = "ab日本 cd".into();
+        app.input_cursor = 4;
+
+        app.apply_action(Action::InputEdit(TextEditAction::Backspace));
+        assert_eq!(app.input_buffer, "ab日 cd");
+        assert_eq!(app.input_cursor, 3);
+
+        app.apply_action(Action::InputEdit(TextEditAction::DeleteToStart));
+        assert_eq!(app.input_buffer, " cd");
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(app.input_kill_buffer, "ab日");
+
+        app.apply_action(Action::InputEdit(TextEditAction::Yank));
+        assert_eq!(app.input_buffer, "ab日 cd");
+        assert_eq!(app.input_cursor, 3);
+    }
+
+    #[test]
+    fn input_editor_supports_word_motion_and_deletion() {
+        let mut app = App::new(Config::default());
+        app.input_target = Some(InputTarget::Filters);
+        app.input_buffer = "one two three".into();
+        app.input_cursor = app.input_buffer.chars().count();
+
+        app.apply_action(Action::InputEdit(TextEditAction::MoveWordLeft));
+        assert_eq!(app.input_cursor, 8);
+        app.apply_action(Action::InputEdit(TextEditAction::DeletePrevWord));
+        assert_eq!(app.input_buffer, "one three");
+        assert_eq!(app.input_cursor, 4);
+    }
+
+    #[test]
+    fn field_selector_uses_schema_order_and_supports_clearing() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.content_field_order = vec!["body".into(), "title".into(), "eyecatch".into()];
+        app.fields = Some("title".into());
+
+        app.apply_action(Action::EditFields);
+        assert!(matches!(
+            app.query_selector,
+            Some(QuerySelector::Fields { ref selected, .. }) if selected.contains("title")
+        ));
+        app.apply_action(Action::QuerySelectorToggle);
+        assert_eq!(
+            app.apply_action(Action::QuerySelectorApply),
+            Command::FetchContents
+        );
+        assert_eq!(app.fields.as_deref(), Some("body,title"));
+
+        app.state = LoadState::ContentsLoaded;
+        app.apply_action(Action::EditFields);
+        app.apply_action(Action::QuerySelectorToggle);
+        app.apply_action(Action::QuerySelectorMoveDown);
+        app.apply_action(Action::QuerySelectorToggle);
+        assert_eq!(
+            app.apply_action(Action::QuerySelectorApply),
+            Command::FetchContents
+        );
+        assert_eq!(app.fields, None);
+    }
+
+    #[test]
+    fn ids_are_normalized_from_commas() {
+        assert_eq!(
+            normalize_ids(" first, second, third , fourth "),
+            "first,second,third,fourth"
+        );
+        assert_eq!(normalize_ids("  ,  "), "");
+    }
+
+    #[test]
+    fn depth_and_rich_editor_format_select_only_official_values_or_unset() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+
+        app.apply_action(Action::EditDepth);
+        for _ in 0..3 {
+            app.apply_action(Action::QuerySelectorMoveDown);
+        }
+        assert_eq!(
+            app.apply_action(Action::QuerySelectorApply),
+            Command::FetchContents
+        );
+        assert_eq!(app.depth, Some(2));
+
+        app.state = LoadState::ContentsLoaded;
+        app.apply_action(Action::EditRichEditorFormat);
+        app.apply_action(Action::QuerySelectorMoveDown);
+        app.apply_action(Action::QuerySelectorMoveDown);
+        assert_eq!(
+            app.apply_action(Action::QuerySelectorApply),
+            Command::FetchContents
+        );
+        assert_eq!(app.rich_editor_format.as_deref(), Some("object"));
+
+        app.state = LoadState::ContentsLoaded;
+        app.apply_action(Action::EditRichEditorFormat);
+        app.apply_action(Action::QuerySelectorMoveUp);
+        app.apply_action(Action::QuerySelectorMoveUp);
+        app.apply_action(Action::QuerySelectorApply);
+        assert_eq!(app.rich_editor_format, None);
+    }
+
+    #[test]
+    fn endpoint_selection_restores_its_cached_schema_fields() {
+        let mut app = App::new(Config::default());
+        app.apis = vec![ApiInfo {
+            endpoint: "articles".into(),
+            name: None,
+            description: None,
+        }];
+        app.state = LoadState::ApisLoaded;
+        app.schema_cache.insert(
+            "articles".into(),
+            CachedSchema {
+                create_template: Some(json!({"headline": "", "body": ""})),
+                field_order: vec!["headline".into(), "body".into()],
+            },
+        );
+
+        assert_eq!(app.apply_action(Action::Select), Command::FetchContents);
+        assert_eq!(app.content_field_order, vec!["headline", "body"]);
+        assert_eq!(
+            app.create_template,
+            Some(json!({"headline": "", "body": ""}))
+        );
     }
 }

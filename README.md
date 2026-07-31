@@ -39,6 +39,8 @@ The API key needs Management API access for endpoint discovery and `GET`, `POST`
 
 Publishing and returning content to draft with `P`/`D` requires the Management API **Change content publication status** permission. Status dots require the Management API **Retrieve Content (List/Detail)** permission, and schema-based create templates require **Retrieve API Information** permission.
 
+Publication reservations require the Management API **Change Content Scheduling** permission. Reservation and draft comparison also use Management API content metadata; published/draft comparison fetches both Content API detail representations and therefore requires Content API GET access.
+
 Create and update operations open a temporary JSON file using `$EDITOR`, falling back to `vi`. Create JSON is generated from the selected endpoint's Management API schema and shows every parsed field with a microCMS-compatible empty value; create is disabled when that schema cannot be loaded or contains no parseable user fields. The update buffer uses the same schema template, overlaid with the selected content, so fields absent from the API response remain editable. Create and update preserve empty user-field values in POST/PATCH payloads. System metadata fields such as content IDs and timestamps are hidden from the edit buffer and omitted from POST/PATCH payloads automatically. Closing the editor without changing the JSON cancels the create/update operation.
 
 Content labels use the first non-empty value in Management API `apiFields` order; no field name such as `title` or `name` receives special priority. JSON previews show system metadata first, followed by user fields in `apiFields` order and then any fields absent from the schema. Create and update editor buffers keep user fields in the same schema order. Content API keys come from `fieldId`, not the schema's display `name`.
@@ -74,9 +76,16 @@ Content browser:
 - `/`: edit keyword search (`q`) inline
 - `f`: edit a `filters` expression inline
 - `o`: edit an `orders` expression inline
-- `x`: clear `q`, `filters`, and `orders`
+- `l`: select `fields` from the current endpoint schema
+- `z`: select reference `depth` (unset or `0` through `3`)
+- `i`: edit comma-separated content `ids`
+- `K`: edit `draftKey`
+- `m`: select `richEditorFormat` (unset, `html`, or `object`)
+- `x`: clear all Content API query options
 - `P`: publish all marked contents, or the current content when none are marked
 - `D`: return all marked contents to draft, or the current content when none are marked
+- `s`: view or edit the selected content's publication reservation
+- `v`: compare the selected content's published and draft versions
 
 Fullscreen JSON preview:
 
@@ -87,6 +96,8 @@ Fullscreen JSON preview:
 - `e`/`E`: edit the displayed content with default/draft PATCH
 - `d`: request deletion of the displayed content
 - `P`/`D`: publish or return the displayed content to draft
+- `s`: view or edit the displayed content's publication reservation
+- `v`: compare the displayed content's published and draft versions
 
 Selection, create, query, endpoint navigation, and page-fetch actions are disabled while the fullscreen preview is open.
 
@@ -96,9 +107,15 @@ Default/published writes (`c`, `u`, and `e`) and Management API publication chan
 
 Search, filter, and order strings are passed directly to the microCMS Content API as the `q`, `filters`, and `orders` query parameters. For example, orders can be `publishedAt`, `-publishedAt`, or `publishedAt,-updatedAt`. When `orders` is omitted, microCMS may relevance-sort keyword search results.
 
-Query input is shown in a centered prompt inside the TUI. Press `Enter` to apply the input or `Esc` to cancel it; applying empty or whitespace-only input clears that value.
+The `fields`, `depth`, `ids`, `draftKey`, and `richEditorFormat` settings are passed to the Content API only when selected or nonempty. `fields` uses a multi-select checklist generated dynamically from the current endpoint's cached Management API schema and preserves `apiFields` order; the TUI also requests `id` internally so status metadata and content operations remain available. `depth` is selected from unset or `0` through `3`, and `richEditorFormat` from unset, `html`, or `object`. The IDs editor accepts comma-separated IDs and trims each value. `draftKey` remains a single text input. Returning to the endpoint picker clears all Content API query settings.
 
-Marked content rows have a yellow left bar. Content row dots use Management API status metadata: green is published, cyan is draft, adjacent green and cyan dots mean published with a newer draft, red is closed, and gray is unknown. Gray means metadata was unavailable or could not be matched to the Content API result. Publication status changes reload the current page; an item may be hidden afterward if API key permissions or the active query/filter exclude it.
+Query input is shown in a centered prompt inside the TUI. Press `Enter` to apply the input or `Esc` to cancel it; applying empty or whitespace-only input clears that value. The prompt uses a real terminal cursor and supports `Left`/`Right`, `Home`/`End`, `Ctrl-A`/`Ctrl-E`, `Ctrl-B`/`Ctrl-F`, `Ctrl-U`/`Ctrl-K`, `Ctrl-W`, `Ctrl-H`/`Ctrl-D`, `Ctrl-T`, `Ctrl-Y`, and `Alt-B`/`Alt-F`/`Alt-D`/`Alt-Backspace` line editing.
+
+The reservation editor opened by `s` shows the current publication status and start/end reservation. Enter local time as `YYYY-MM-DD HH:MM` (converted to ISO 8601 using the local time zone) or enter ISO 8601 directly. It supports the same cursor and line-editing shortcuts as query input. `Tab` changes fields, `Enter` reviews the request, `F8` requests removal of both reservation times, and `Esc` cancels. Every reservation update/removal requires confirmation. microCMS applies status-dependent rules: draft/closed content cannot set only a stop time, published content cannot set only a new publish time, and a published stop/re-publish cycle requires the stop time before the next publish time. The TUI validates these cases before sending.
+
+The version viewer opened by `v` requires a `draftKey` in Management API metadata. Use `1` for the published version, `2` for the draft version, `j`/`k` to scroll, and `Enter`/`Esc` to close it. When no draft key exists, the TUI reports that no draft version is available.
+
+Marked content rows have a yellow left bar. Content row dots use Management API status metadata: green is published, cyan is draft, adjacent green and cyan dots mean published with a newer draft, red is closed, and gray is unknown. Content with a publication start and/or stop reservation adds a magenta dot immediately beside the publication-status dots, with no separating gap; the selected content's reservation times are also shown in the status bar. Gray means metadata was unavailable or could not be matched to the Content API result. Publication status changes reload the current page; an item may be hidden afterward if API key permissions or the active query/filter exclude it.
 
 ## Object API support
 

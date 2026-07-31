@@ -53,6 +53,18 @@ pub struct ContentMeta {
     pub id: String,
     #[serde(default)]
     pub status: Vec<String>,
+    #[serde(default, rename = "draftKey")]
+    pub draft_key: Option<String>,
+    #[serde(default, rename = "reservationTime")]
+    pub reservation_time: Option<ReservationTime>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct ReservationTime {
+    #[serde(default, rename = "publishTime")]
+    pub publish_time: Option<String>,
+    #[serde(default, rename = "stopTime")]
+    pub stop_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,14 +72,49 @@ pub struct ContentQuery {
     pub q: Option<String>,
     pub filters: Option<String>,
     pub orders: Option<String>,
+    pub fields: Option<String>,
+    pub depth: Option<u8>,
+    pub ids: Option<String>,
+    pub draft_key: Option<String>,
+    pub rich_editor_format: Option<String>,
 }
 
-#[cfg(test)]
 impl ContentQuery {
+    #[cfg(test)]
     pub fn has_query(&self) -> bool {
-        [&self.q, &self.filters, &self.orders]
-            .into_iter()
-            .any(|value| value.as_deref().map_or(false, |value| !value.is_empty()))
+        [
+            &self.q,
+            &self.filters,
+            &self.orders,
+            &self.fields,
+            &self.ids,
+            &self.draft_key,
+            &self.rich_editor_format,
+        ]
+        .into_iter()
+        .any(|value| nonempty(value).is_some())
+            || self.depth.is_some()
+    }
+
+    fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        for (key, value) in [
+            ("q", &self.q),
+            ("filters", &self.filters),
+            ("orders", &self.orders),
+            ("fields", &self.fields),
+            ("ids", &self.ids),
+            ("draftKey", &self.draft_key),
+            ("richEditorFormat", &self.rich_editor_format),
+        ] {
+            if let Some(value) = nonempty(value) {
+                pairs.push((key, value.to_string()));
+            }
+        }
+        if let Some(depth) = self.depth {
+            pairs.push(("depth", depth.to_string()));
+        }
+        pairs
     }
 }
 
@@ -112,16 +159,7 @@ impl MicroCmsClient {
             bail!("api_key is missing or empty");
         }
 
-        let content_api_url = api_url_from_env(
-            "MICROCMS_CONTENT_API_URL",
-            &service_id,
-            "https://microcms.io",
-        )?;
-        let management_api_url = api_url_from_env(
-            "MICROCMS_MANAGEMENT_API_URL",
-            &service_id,
-            "https://microcms-management.io",
-        )?;
+        let (content_api_url, management_api_url) = api_urls_from_env(&service_id)?;
 
         Ok(Self {
             api_key,
@@ -170,6 +208,7 @@ impl MicroCmsClient {
         limit: usize,
         offset: usize,
         query: &ContentQuery,
+        expected_kind: Option<ContentCollectionKind>,
     ) -> Result<ContentCollection> {
         let endpoint = endpoint.trim().trim_matches('/');
         if endpoint.is_empty() {
@@ -182,14 +221,9 @@ impl MicroCmsClient {
             .get(url)
             .header("X-MICROCMS-API-KEY", &self.api_key)
             .query(&[("limit", limit), ("offset", offset)]);
-        if let Some(q) = nonempty(&query.q) {
-            request = request.query(&[("q", q)]);
-        }
-        if let Some(filters) = nonempty(&query.filters) {
-            request = request.query(&[("filters", filters)]);
-        }
-        if let Some(orders) = nonempty(&query.orders) {
-            request = request.query(&[("orders", orders)]);
+        let query_pairs = query.query_pairs();
+        if !query_pairs.is_empty() {
+            request = request.query(&query_pairs);
         }
 
         let response = request.send().await.context("microCMS request failed")?;
@@ -205,7 +239,42 @@ impl MicroCmsClient {
             .json()
             .await
             .context("failed to decode the microCMS content response")?;
-        parse_content_collection(value)
+        parse_content_collection(value, limit, offset, expected_kind)
+    }
+
+    pub async fn get_content_version(
+        &self,
+        endpoint: &str,
+        content_id: &str,
+        query: &ContentQuery,
+    ) -> Result<Value> {
+        let endpoint = normalized_segment(endpoint, "endpoint")?;
+        let content_id = normalized_segment(content_id, "content ID")?;
+        let url = format!("{}/api/v1/{endpoint}/{content_id}", self.content_api_url);
+        let mut request = self
+            .http
+            .get(url)
+            .header("X-MICROCMS-API-KEY", &self.api_key);
+        let query_pairs = query.query_pairs();
+        if !query_pairs.is_empty() {
+            request = request.query(&query_pairs);
+        }
+        let response = request
+            .send()
+            .await
+            .context("microCMS content version request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<response body unavailable>".to_string());
+            bail!("microCMS returned HTTP {status}: {}", body_snippet(&body));
+        }
+        response
+            .json()
+            .await
+            .context("failed to decode the microCMS content version response")
     }
 
     pub async fn create_content(
@@ -281,6 +350,41 @@ impl MicroCmsClient {
             .context("failed to decode the microCMS content metadata response")
     }
 
+    pub async fn get_content_metadata(
+        &self,
+        endpoint: &str,
+        content_id: &str,
+    ) -> Result<ContentMeta> {
+        let endpoint = normalized_segment(endpoint, "endpoint")?;
+        let content_id = normalized_segment(content_id, "content ID")?;
+        let url = format!(
+            "{}/api/v1/contents/{endpoint}/{content_id}",
+            self.management_api_url
+        );
+        let response = self
+            .http
+            .get(url)
+            .header("X-MICROCMS-API-KEY", &self.api_key)
+            .send()
+            .await
+            .context("microCMS Management API content metadata request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<response body unavailable>".to_string());
+            bail!(
+                "microCMS Management API returned HTTP {status}: {}",
+                body_snippet(&body)
+            );
+        }
+        response
+            .json()
+            .await
+            .context("failed to decode the microCMS content metadata response")
+    }
+
     pub async fn update_content(
         &self,
         endpoint: &str,
@@ -333,6 +437,28 @@ impl MicroCmsClient {
         send_mutation(request, "change content publication status").await
     }
 
+    pub async fn update_reservation(
+        &self,
+        endpoint: &str,
+        content_id: &str,
+        publish_time: Option<&str>,
+        stop_time: Option<&str>,
+    ) -> Result<()> {
+        let endpoint = normalized_segment(endpoint, "endpoint")?;
+        let content_id = normalized_segment(content_id, "content ID")?;
+        let url = format!(
+            "{}/api/v1/contents/{endpoint}/{content_id}/reservation",
+            self.management_api_url
+        );
+        let body = reservation_body(publish_time, stop_time);
+        let request = self
+            .http
+            .put(url)
+            .header("X-MICROCMS-API-KEY", &self.api_key)
+            .json(&body);
+        send_mutation(request, "update content publication reservation").await
+    }
+
     async fn get(&self, url: String) -> Result<Value> {
         let response = self
             .http
@@ -359,23 +485,60 @@ impl MicroCmsClient {
     }
 }
 
-fn parse_content_collection(value: Value) -> Result<ContentCollection> {
+fn reservation_body(publish_time: Option<&str>, stop_time: Option<&str>) -> Value {
+    let mut body = serde_json::Map::new();
+    if let Some(publish_time) = publish_time {
+        body.insert("publishTime".into(), Value::String(publish_time.into()));
+    }
+    if let Some(stop_time) = stop_time {
+        body.insert("stopTime".into(), Value::String(stop_time.into()));
+    }
+    Value::Object(body)
+}
+
+fn parse_content_collection(
+    value: Value,
+    requested_limit: usize,
+    requested_offset: usize,
+    expected_kind: Option<ContentCollectionKind>,
+) -> Result<ContentCollection> {
     let object = value
         .as_object()
         .context("microCMS content response must be a JSON object")?;
 
-    if let (Some(contents), Some(total_count), Some(offset), Some(limit)) = (
-        object.get("contents").and_then(Value::as_array),
-        object.get("totalCount").and_then(Value::as_u64),
-        object.get("offset").and_then(Value::as_u64),
-        object.get("limit").and_then(Value::as_u64),
-    ) {
+    let has_complete_list_metadata = object.get("totalCount").and_then(Value::as_u64).is_some()
+        && object.get("offset").and_then(Value::as_u64).is_some()
+        && object.get("limit").and_then(Value::as_u64).is_some();
+    let contents = object.get("contents").and_then(Value::as_array);
+    let treat_as_list = match expected_kind {
+        Some(ContentCollectionKind::List) => contents.is_some(),
+        Some(ContentCollectionKind::Object) => false,
+        None => contents.is_some() && has_complete_list_metadata,
+    };
+    if treat_as_list {
+        let Some(contents) = contents else {
+            bail!("list response does not contain a contents array");
+        };
+        let offset = object
+            .get("offset")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(requested_offset);
+        let limit = object
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(requested_limit);
+        let total_count = object
+            .get("totalCount")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_else(|| offset.saturating_add(contents.len()));
         return Ok(ContentCollection {
             kind: ContentCollectionKind::List,
-            total_count: usize::try_from(total_count)
-                .context("list response field totalCount is too large")?,
-            offset: usize::try_from(offset).context("list response field offset is too large")?,
-            limit: usize::try_from(limit).context("list response field limit is too large")?,
+            total_count,
+            offset,
+            limit,
             contents: contents.clone(),
         });
     }
@@ -390,16 +553,44 @@ fn parse_content_collection(value: Value) -> Result<ContentCollection> {
 }
 
 fn nonempty(value: &Option<String>) -> Option<&str> {
-    value.as_deref().filter(|value| !value.is_empty())
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
-fn api_url_from_env(name: &str, service_id: &str, default: &str) -> Result<String> {
-    let configured = std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_string());
-    service_api_url(service_id, &configured)
-        .with_context(|| format!("invalid {name} environment variable"))
+fn api_urls_from_env(service_id: &str) -> Result<(String, String)> {
+    resolve_api_urls(
+        service_id,
+        std::env::var("MICROCMS_CONTENT_API_URL").ok(),
+        std::env::var("MICROCMS_MANAGEMENT_API_URL").ok(),
+    )
+}
+
+fn resolve_api_urls(
+    service_id: &str,
+    content_domain: Option<String>,
+    management_domain: Option<String>,
+) -> Result<(String, String)> {
+    let resolve = |name: &str, configured: Option<String>, default: &str| {
+        let domain = configured
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default.to_string());
+        service_api_url(service_id, &domain)
+            .with_context(|| format!("invalid {name} environment variable"))
+    };
+    Ok((
+        resolve(
+            "MICROCMS_CONTENT_API_URL",
+            content_domain,
+            "https://microcms.io",
+        )?,
+        resolve(
+            "MICROCMS_MANAGEMENT_API_URL",
+            management_domain,
+            "https://microcms-management.io",
+        )?,
+    ))
 }
 
 fn service_api_url(service_id: &str, base_url: &str) -> Result<String> {
@@ -501,14 +692,62 @@ mod tests {
             q: Some(String::new()),
             filters: None,
             orders: None,
+            ..ContentQuery::default()
         }
         .has_query());
         assert!(ContentQuery {
             q: Some("keyword".into()),
             filters: None,
             orders: None,
+            ..ContentQuery::default()
         }
         .has_query());
+    }
+
+    #[test]
+    fn content_query_includes_only_configured_extended_parameters() {
+        let query = ContentQuery {
+            fields: Some("title,author.name".into()),
+            depth: Some(2),
+            ids: Some("one,two".into()),
+            draft_key: Some("draft-key".into()),
+            rich_editor_format: Some("object".into()),
+            ..ContentQuery::default()
+        };
+        assert_eq!(
+            query.query_pairs(),
+            vec![
+                ("fields", "title,author.name".into()),
+                ("ids", "one,two".into()),
+                ("draftKey", "draft-key".into()),
+                ("richEditorFormat", "object".into()),
+                ("depth", "2".into()),
+            ]
+        );
+        assert!(query.has_query());
+        assert!(ContentQuery {
+            fields: Some("  ".into()),
+            ..ContentQuery::default()
+        }
+        .query_pairs()
+        .is_empty());
+    }
+
+    #[test]
+    fn reservation_body_supports_start_end_both_and_clear() {
+        assert_eq!(
+            reservation_body(Some("start"), Some("stop")),
+            json!({"publishTime": "start", "stopTime": "stop"})
+        );
+        assert_eq!(
+            reservation_body(Some("start"), None),
+            json!({"publishTime": "start"})
+        );
+        assert_eq!(
+            reservation_body(None, Some("stop")),
+            json!({"stopTime": "stop"})
+        );
+        assert_eq!(reservation_body(None, None), json!({}));
     }
 
     #[test]
@@ -537,13 +776,56 @@ mod tests {
     }
 
     #[test]
+    fn resolves_default_content_and_management_api_urls() {
+        assert_eq!(
+            resolve_api_urls("service", None, None).unwrap(),
+            (
+                "https://service.microcms.io".into(),
+                "https://service.microcms-management.io".into()
+            )
+        );
+    }
+
+    #[test]
+    fn resolves_overridden_domains_for_both_apis_without_changing_service_id() {
+        assert_eq!(
+            resolve_api_urls(
+                "same-service",
+                Some("https://microcms-staging.net".into()),
+                Some("https://microcms-management-staging.net".into())
+            )
+            .unwrap(),
+            (
+                "https://same-service.microcms-staging.net".into(),
+                "https://same-service.microcms-management-staging.net".into()
+            )
+        );
+    }
+
+    #[test]
+    fn empty_api_url_overrides_use_normal_domains() {
+        assert_eq!(
+            resolve_api_urls("service", Some("  ".into()), Some(String::new())).unwrap(),
+            (
+                "https://service.microcms.io".into(),
+                "https://service.microcms-management.io".into()
+            )
+        );
+    }
+
+    #[test]
     fn parses_list_content_collection() {
-        let collection = parse_content_collection(json!({
-            "contents": [{"id": "one"}, {"id": "two"}],
-            "totalCount": 12,
-            "offset": 4,
-            "limit": 2
-        }))
+        let collection = parse_content_collection(
+            json!({
+                "contents": [{"id": "one"}, {"id": "two"}],
+                "totalCount": 12,
+                "offset": 4,
+                "limit": 2
+            }),
+            20,
+            0,
+            None,
+        )
         .unwrap();
 
         assert_eq!(collection.kind, ContentCollectionKind::List);
@@ -554,13 +836,50 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_list_uses_contents_array_and_requested_pagination_fallback() {
+        let collection = parse_content_collection(
+            json!({"contents": [{"id": "only-match", "title": "Matched"}]}),
+            20,
+            0,
+            Some(ContentCollectionKind::List),
+        )
+        .unwrap();
+
+        assert_eq!(collection.kind, ContentCollectionKind::List);
+        assert_eq!(
+            collection.contents,
+            vec![json!({"id": "only-match", "title": "Matched"})]
+        );
+        assert_eq!(collection.limit, 20);
+        assert_eq!(collection.offset, 0);
+        assert_eq!(collection.total_count, 1);
+    }
+
+    #[test]
+    fn confirmed_object_endpoint_is_not_reclassified_by_user_contents_fields() {
+        let value = json!({
+            "contents": [{"label": "user field"}],
+            "totalCount": 1,
+            "offset": 0,
+            "limit": 1
+        });
+        let collection =
+            parse_content_collection(value.clone(), 20, 0, Some(ContentCollectionKind::Object))
+                .unwrap();
+
+        assert_eq!(collection.kind, ContentCollectionKind::Object);
+        assert_eq!(collection.contents, vec![value]);
+        assert_eq!(collection.limit, 1);
+    }
+
+    #[test]
     fn parses_object_content_collection_without_contents_array() {
         let value = json!({
             "title": "About",
             "totalCount": 99,
             "contents": "a user-defined non-array field"
         });
-        let collection = parse_content_collection(value.clone()).unwrap();
+        let collection = parse_content_collection(value.clone(), 20, 0, None).unwrap();
 
         assert_eq!(collection.kind, ContentCollectionKind::Object);
         assert_eq!(collection.total_count, 1);
@@ -569,22 +888,31 @@ mod tests {
         assert_eq!(collection.contents, vec![value]);
 
         let user_contents_array = json!({"contents": ["user value"], "title": "Object"});
-        let collection = parse_content_collection(user_contents_array.clone()).unwrap();
+        let collection =
+            parse_content_collection(user_contents_array.clone(), 20, 0, None).unwrap();
         assert_eq!(collection.kind, ContentCollectionKind::Object);
         assert_eq!(collection.contents, vec![user_contents_array]);
     }
 
     #[test]
     fn rejects_non_object_content_collection() {
-        assert!(parse_content_collection(json!([])).is_err());
-        assert!(parse_content_collection(json!("content")).is_err());
+        assert!(parse_content_collection(json!([]), 20, 0, None).is_err());
+        assert!(parse_content_collection(json!("content"), 20, 0, None).is_err());
     }
 
     #[test]
     fn parses_management_content_metadata_response() {
         let metadata: ContentMetaList = serde_json::from_value(json!({
             "contents": [
-                {"id": "published", "status": ["PUBLISH"]},
+                {
+                    "id": "published",
+                    "status": ["PUBLISH"],
+                    "draftKey": "draft-key",
+                    "reservationTime": {
+                        "publishTime": "2026-08-01T00:00:00Z",
+                        "stopTime": "2026-08-31T14:59:00Z"
+                    }
+                },
                 {"id": "unknown"}
             ],
             "totalCount": 2,
@@ -597,6 +925,14 @@ mod tests {
         assert_eq!(metadata.offset, 0);
         assert_eq!(metadata.limit, 20);
         assert_eq!(metadata.contents[0].status, vec!["PUBLISH".to_string()]);
+        assert_eq!(metadata.contents[0].draft_key.as_deref(), Some("draft-key"));
+        assert_eq!(
+            metadata.contents[0]
+                .reservation_time
+                .as_ref()
+                .and_then(|value| value.publish_time.as_deref()),
+            Some("2026-08-01T00:00:00Z")
+        );
         assert!(metadata.contents[1].status.is_empty());
     }
 
