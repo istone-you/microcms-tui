@@ -19,6 +19,29 @@ pub struct ServiceInfo {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemberInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub email: String,
+    #[serde(default)]
+    pub mfa: bool,
+    #[serde(default)]
+    pub inviting: bool,
+    #[serde(default, rename = "lastAccessedAt")]
+    pub last_accessed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct MemberList {
+    pub members: Vec<MemberInfo>,
+    #[serde(rename = "totalCount")]
+    pub total_count: usize,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiInfo {
     pub endpoint: String,
@@ -185,6 +208,45 @@ impl MicroCmsClient {
         let url = format!("{}/api/v1/service", self.management_api_url);
         let value = self.get(url).await?;
         parse_service_info(value)
+    }
+
+    pub async fn list_members(&self) -> Result<MemberList> {
+        let url = format!("{}/api/v1/members", self.management_api_url);
+        let first_value = self
+            .get_with_query(url.clone(), &[("limit", "100")])
+            .await?;
+        let first: MemberList = serde_json::from_value(first_value)
+            .context("failed to decode the microCMS member list response")?;
+        let total_count = first.total_count;
+        let mut members = first.members;
+        let mut token = first.token.filter(|token| !token.is_empty());
+        while let Some(current_token) = token.take() {
+            let value = self
+                .get_with_query(
+                    url.clone(),
+                    &[("limit", "100"), ("token", current_token.as_str())],
+                )
+                .await?;
+            let page: MemberList = serde_json::from_value(value)
+                .context("failed to decode the microCMS member list response")?;
+            members.extend(page.members);
+            token = page
+                .token
+                .filter(|next| !next.is_empty() && next != &current_token);
+        }
+        Ok(MemberList {
+            members,
+            total_count,
+            token: None,
+        })
+    }
+
+    pub async fn get_member(&self, member_id: &str) -> Result<MemberInfo> {
+        let member_id = normalized_segment(member_id, "member ID")?;
+        let url = format!("{}/api/v1/members/{member_id}", self.management_api_url);
+        let value = self.get(url).await?;
+        serde_json::from_value(value)
+            .context("failed to decode the microCMS member detail response")
     }
 
     pub async fn get_api_schema(&self, endpoint: &str) -> Result<Value> {
@@ -449,6 +511,27 @@ impl MicroCmsClient {
         send_mutation(request, "change content publication status").await
     }
 
+    pub async fn update_content_creator(
+        &self,
+        endpoint: &str,
+        content_id: &str,
+        member_id: &str,
+    ) -> Result<()> {
+        let endpoint = normalized_segment(endpoint, "endpoint")?;
+        let content_id = normalized_segment(content_id, "content ID")?;
+        let member_id = normalized_segment(member_id, "member ID")?;
+        let url = format!(
+            "{}/api/v1/contents/{endpoint}/{content_id}/createdBy",
+            self.management_api_url
+        );
+        let request = self
+            .http
+            .patch(url)
+            .header("X-MICROCMS-API-KEY", &self.api_key)
+            .json(&serde_json::json!({"createdBy": member_id}));
+        send_mutation(request, "change content creator").await
+    }
+
     pub async fn update_reservation(
         &self,
         endpoint: &str,
@@ -472,10 +555,15 @@ impl MicroCmsClient {
     }
 
     async fn get(&self, url: String) -> Result<Value> {
+        self.get_with_query(url, &[]).await
+    }
+
+    async fn get_with_query(&self, url: String, query: &[(&str, &str)]) -> Result<Value> {
         let response = self
             .http
             .get(url)
             .header("X-MICROCMS-API-KEY", &self.api_key)
+            .query(query)
             .send()
             .await
             .context("microCMS Management API request failed")?;
@@ -1029,5 +1117,39 @@ mod tests {
         );
         assert!(parse_service_info(json!({"name": "  "})).is_err());
         assert!(parse_service_info(json!({})).is_err());
+    }
+
+    #[test]
+    fn parses_official_member_list_and_detail_shapes() {
+        let list: MemberList = serde_json::from_value(json!({
+            "members": [{
+                "id": "member-1",
+                "name": "Editor",
+                "email": "editor@example.com",
+                "mfa": true,
+                "inviting": false,
+                "lastAccessedAt": null
+            }],
+            "totalCount": 1,
+            "token": "next-token"
+        }))
+        .unwrap();
+        assert_eq!(list.total_count, 1);
+        assert_eq!(list.token.as_deref(), Some("next-token"));
+        assert_eq!(list.members[0].name, "Editor");
+
+        let detail: MemberInfo = serde_json::from_value(json!({
+            "id": "member-1",
+            "name": "Editor",
+            "email": "editor@example.com",
+            "mfa": true,
+            "lastAccessedAt": "2026-01-01T00:00:00.000Z"
+        }))
+        .unwrap();
+        assert!(!detail.inviting);
+        assert_eq!(
+            detail.last_accessed_at.as_deref(),
+            Some("2026-01-01T00:00:00.000Z")
+        );
     }
 }

@@ -9,9 +9,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    content_id, content_label, ordered_content_for_display, App, ContentPublicationState,
-    InputTarget, LoadState, PendingConfirmation, QuerySelector, ReservationField, Screen,
-    VersionView,
+    content_id, content_label, member_display_name, ordered_content_for_display, App,
+    ContentPublicationState, InputTarget, LoadState, PendingConfirmation, QuerySelector,
+    ReservationField, Screen, VersionView,
 };
 use crate::microcms::ContentCollectionKind;
 
@@ -34,6 +34,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.query_selector.is_some() {
         draw_query_selector_modal(frame, app);
     }
+    if app.member_picker.is_some() {
+        draw_member_picker_modal(frame, app);
+    }
     if app.reservation_input.is_some() {
         draw_reservation_modal(frame, app);
     }
@@ -52,11 +55,24 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let status = match app.screen {
         Screen::EndpointPicker => picker_status(app),
         Screen::ContentBrowser => content_status(app),
+        Screen::Members => members_status(app),
     };
     frame.render_widget(
         Paragraph::new(Line::from(status)).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
         area,
     );
+}
+
+fn members_status(app: &App) -> String {
+    let service_id = app.config.service_id.as_deref().unwrap_or("<not set>");
+    let state = if app.members_loading {
+        "loading...".to_string()
+    } else if let Some(message) = &app.message {
+        message.clone()
+    } else {
+        format!("{} total", app.members_total_count)
+    };
+    format!(" microcms-tui | id: {service_id} | Members | {state}")
 }
 
 fn picker_status(app: &App) -> String {
@@ -184,7 +200,48 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
     match app.screen {
         Screen::EndpointPicker => draw_endpoint_picker(frame, app, area),
         Screen::ContentBrowser => draw_content_browser(frame, app, area),
+        Screen::Members => draw_members(frame, app, area),
     }
+}
+
+fn draw_members(frame: &mut Frame, app: &App, area: Rect) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+    let items = app
+        .members
+        .iter()
+        .map(|member| ListItem::new(member_display_name(member)))
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Members"))
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let selected = (!app.members.is_empty()).then_some(app.member_selected);
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(list, columns[0], &mut state);
+
+    let detail = app
+        .member_detail
+        .as_ref()
+        .or_else(|| app.members.get(app.member_selected))
+        .and_then(|member| serde_json::to_string_pretty(member).ok())
+        .unwrap_or_else(|| "No member selected.".into());
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Member detail"),
+            )
+            .wrap(Wrap { trim: false }),
+        columns[1],
+    );
 }
 
 fn draw_missing_config(frame: &mut Frame, missing: &[String], area: Rect) {
@@ -424,6 +481,8 @@ fn footer_text(app: &App) -> &'static str {
         " j/k move | Space toggle | Enter apply | Esc cancel"
     } else if app.query_selector.is_some() {
         " j/k choose | Enter apply | Esc cancel"
+    } else if app.member_picker.is_some() {
+        " j/k choose | Enter select | Esc cancel"
     } else if app.reservation_input.is_some() {
         " Tab field | Enter review | F8 clear | Esc cancel"
     } else if app.pending_confirmation.is_some() {
@@ -435,6 +494,7 @@ fn footer_text(app: &App) -> &'static str {
     } else {
         match app.screen {
             Screen::EndpointPicker => " Enter select | ? help",
+            Screen::Members => " Enter detail | r reload | b/Esc back | ? help",
             Screen::ContentBrowser if app.content_kind == ContentCollectionKind::Object => {
                 " j/k scroll | g/G top/bottom | r reload | b/Esc back | ? help"
             }
@@ -451,6 +511,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
         Text::from(vec![
             Line::from("Object API (GET-only)"),
             Line::from("  ? open/close help"),
+            Line::from("  M members"),
             Line::from(""),
             Line::from("JSON preview"),
             Line::from("  j/k, Up/Down scroll        g/G top/bottom"),
@@ -461,10 +522,18 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from(""),
             Line::from("  Create, edit, delete, bulk, and status operations are unavailable."),
         ])
+    } else if app.screen == Screen::Members {
+        Text::from(vec![
+            Line::from("Members"),
+            Line::from("  j/k, Up/Down move"),
+            Line::from("  Enter fetch detail          r reload"),
+            Line::from("  b, Esc back                 ? open/close help"),
+        ])
     } else {
         Text::from(vec![
             Line::from("Global"),
             Line::from("  ? open/close help"),
+            Line::from("  M members"),
             Line::from(""),
             Line::from("Navigation"),
             Line::from("  j/k, Up/Down move list      Enter preview/select endpoint"),
@@ -477,7 +546,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("Query"),
             Line::from("  / search q                  f filters"),
             Line::from("  o orders   l fields selector   z depth selector"),
-            Line::from("  i IDs   K draftKey   m format selector   x clear"),
+            Line::from("  i IDs   K draftKey   F format selector   x clear"),
             Line::from(""),
             Line::from("Content write"),
             Line::from("  c/C POST default/draft      u/U PUT with ID default/draft"),
@@ -487,6 +556,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("  Space mark current          d delete marked/current"),
             Line::from("  P publish (Management API)  D draft (Management API)"),
             Line::from("  s publication reservation   v published/draft comparison"),
+            Line::from("  m change content creator   M members"),
         ])
     };
     clear_modal_background(frame, area);
@@ -501,6 +571,49 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
                     .title("Help"),
             )
             .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_member_picker_modal(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.member_picker.as_ref() else {
+        return;
+    };
+    let height = (app.members.len() as u16 + 2).clamp(5, 18);
+    let area = centered_modal_with_max_width(frame.area(), 68, height, 76);
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let first = picker
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows.max(1));
+    let lines = app
+        .members
+        .iter()
+        .skip(first)
+        .take(visible_rows)
+        .enumerate()
+        .map(|(index, member)| {
+            let line = Line::from(member_display_name(member));
+            if first + index == picker.selected {
+                line.style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    clear_modal_background(frame, area);
+    frame.render_widget(
+        Paragraph::new(lines).style(modal_style()).block(
+            Block::default()
+                .style(modal_style())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title("Select content creator"),
+        ),
         area,
     );
 }
@@ -874,6 +987,14 @@ fn confirmation_text(
                 )
             },
             "Existing reservation settings will be overwritten.",
+        ),
+        PendingConfirmation::Creator { member_name, .. } => (
+            "Confirm creator",
+            format!(
+                "Change content creator to {}?",
+                truncate_inline(member_name, 42)
+            ),
+            "The creator metadata for this content will be changed.",
         ),
         PendingConfirmation::PublicationStatus {
             content_ids,

@@ -51,6 +51,7 @@ Content labels use the first non-empty value in Management API `apiFields` order
 
 - `Ctrl-C`: quit from any screen or mode
 - `?`: open or close the centered in-app keybinding help (except while typing in an input modal)
+- `M`: open the service member list
 
 Endpoint picker:
 
@@ -85,12 +86,13 @@ Content browser:
 - `z`: select reference `depth` (unset or `0` through `3`)
 - `i`: edit comma-separated content `ids`
 - `K`: edit `draftKey`
-- `m`: select `richEditorFormat` (unset, `html`, or `object`)
+- `F`: select `richEditorFormat` (unset, `html`, or `object`)
 - `x`: clear all Content API query options
 - `P`: publish all marked contents, or the current content when none are marked
 - `D`: return all marked contents to draft, or the current content when none are marked
 - `s`: view or edit the selected content's publication reservation
 - `v`: compare the selected content's published and draft versions
+- `m`: change the selected content's creator using a member picker
 - Mouse: click a content row to select it; use the wheel over the list to move selection
 
 Fullscreen JSON preview:
@@ -104,10 +106,20 @@ Fullscreen JSON preview:
 - `P`/`D`: publish or return the displayed content to draft
 - `s`: view or edit the displayed content's publication reservation
 - `v`: compare the displayed content's published and draft versions
+- `m`: change the displayed content's creator
 
 Selection, create, query, endpoint navigation, and page-fetch actions are disabled while the fullscreen preview is open.
 
 The mouse wheel scrolls the normal, fullscreen, and Object API JSON previews. Schema-backed query selectors also accept row clicks and wheel movement. Mouse capture is enabled while the TUI is active; terminals commonly require holding `Shift` when selecting text for copy.
+
+Member browser:
+
+- `j`/`Down` and `k`/`Up`: move through service members
+- `Enter`: fetch the selected member's detail
+- `r`: reload the member list
+- `b` or `Esc`: return to the previous screen
+
+Member list/detail retrieval uses Management API `GET /api/v1/members` and `GET /api/v1/members/{member_id}`. Changing a creator uses `PATCH /api/v1/contents/{endpoint}/{content_id}/createdBy`, opens the cached member list as a centered selector, and requires confirmation before sending. The API key needs **Get Members (List/Detail)** and **Change Content Creator** Management API permissions respectively.
 
 Uppercase `C`, `U`, and `E` are thin wrappers over the Content API `status=draft` query. `D` is different: it changes publication status through the Management API, while `E` sends a Content API PATCH with `status=draft`.
 

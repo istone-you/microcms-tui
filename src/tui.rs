@@ -65,6 +65,10 @@ enum MutationRequest {
         publish_time: Option<String>,
         stop_time: Option<String>,
     },
+    Creator {
+        content_id: String,
+        member_id: String,
+    },
 }
 
 impl MutationRequest {
@@ -212,6 +216,7 @@ fn run_loop(terminal: &mut TuiTerminal, config: Config) -> Result<()> {
 fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option<Action> {
     if app.help_open
         || app.input_target.is_some()
+        || app.member_picker.is_some()
         || app.reservation_input.is_some()
         || app.pending_confirmation.is_some()
         || app.version_comparison.is_some()
@@ -230,7 +235,6 @@ fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option
             _ => None,
         };
     }
-
     if app.screen == Screen::ContentBrowser
         && (app.preview_fullscreen || app.content_kind == ContentCollectionKind::Object)
     {
@@ -245,6 +249,7 @@ fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option
     let columns = match app.screen {
         Screen::EndpointPicker => horizontal_columns(main, 60),
         Screen::ContentBrowser => horizontal_columns(main, 40),
+        Screen::Members => horizontal_columns(main, 45),
     };
     let list_area = columns[0];
     if app.screen == Screen::ContentBrowser && rect_contains(columns[1], mouse.column, mouse.row) {
@@ -264,10 +269,13 @@ fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option
             let (selected, len) = match app.screen {
                 Screen::EndpointPicker => (app.api_selected, app.apis.len()),
                 Screen::ContentBrowser => (app.content_selected, app.items.len()),
+                Screen::Members => (app.member_selected, app.members.len()),
             };
             list_index_at(list_area, selected, len, mouse.column, mouse.row).map(|index| {
                 if app.screen == Screen::EndpointPicker {
                     Action::SelectApiAt(index)
+                } else if app.screen == Screen::Members {
+                    Action::SelectMemberAt(index)
                 } else {
                     Action::SelectContentAt(index)
                 }
@@ -399,6 +407,16 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             _ => None,
         };
     }
+    if app.member_picker.is_some() {
+        return match code {
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::MemberPickerMoveDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::MemberPickerMoveUp),
+            KeyCode::Enter => Some(Action::MemberPickerConfirm),
+            KeyCode::Esc => Some(Action::MemberPickerCancel),
+            _ => None,
+        };
+    }
     if app.reservation_input.is_some() {
         return match code {
             KeyCode::Char('?') if key.modifiers.is_empty() => Some(Action::ToggleHelp),
@@ -432,6 +450,20 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             _ => None,
         };
     }
+    if code == KeyCode::Char('M') {
+        return Some(Action::OpenMembers);
+    }
+    if app.screen == Screen::Members {
+        return match code {
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Esc | KeyCode::Char('b') => Some(Action::Back),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+            KeyCode::Enter => Some(Action::FetchMemberDetail),
+            KeyCode::Char('r') => Some(Action::Reload),
+            _ => None,
+        };
+    }
     if app.screen == Screen::ContentBrowser && app.content_kind == ContentCollectionKind::Object {
         return match code {
             KeyCode::Char('?') => Some(Action::ToggleHelp),
@@ -448,7 +480,7 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('z') => Some(Action::EditDepth),
             KeyCode::Char('i') => Some(Action::EditIds),
             KeyCode::Char('K') => Some(Action::EditDraftKey),
-            KeyCode::Char('m') => Some(Action::EditRichEditorFormat),
+            KeyCode::Char('F') => Some(Action::EditRichEditorFormat),
             KeyCode::Char('x') => Some(Action::ClearQuery),
             _ => None,
         };
@@ -470,6 +502,7 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('D') => Some(Action::Draft),
             KeyCode::Char('s') => Some(Action::EditReservation),
             KeyCode::Char('v') => Some(Action::CompareVersions),
+            KeyCode::Char('m') => Some(Action::ChangeCreator),
             _ => None,
         };
     }
@@ -503,7 +536,7 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('z') if app.screen == Screen::ContentBrowser => Some(Action::EditDepth),
         KeyCode::Char('i') if app.screen == Screen::ContentBrowser => Some(Action::EditIds),
         KeyCode::Char('K') if app.screen == Screen::ContentBrowser => Some(Action::EditDraftKey),
-        KeyCode::Char('m') if app.screen == Screen::ContentBrowser => {
+        KeyCode::Char('F') if app.screen == Screen::ContentBrowser => {
             Some(Action::EditRichEditorFormat)
         }
         KeyCode::Char('x') if app.screen == Screen::ContentBrowser => Some(Action::ClearQuery),
@@ -511,6 +544,7 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('D') if app.screen == Screen::ContentBrowser => Some(Action::Draft),
         KeyCode::Char('s') if app.screen == Screen::ContentBrowser => Some(Action::EditReservation),
         KeyCode::Char('v') if app.screen == Screen::ContentBrowser => Some(Action::CompareVersions),
+        KeyCode::Char('m') if app.screen == Screen::ContentBrowser => Some(Action::ChangeCreator),
         KeyCode::Char('n') | KeyCode::PageDown if app.screen == Screen::ContentBrowser => {
             Some(Action::NextPage)
         }
@@ -575,7 +609,9 @@ fn handle_command(
         fetch @ (Command::FetchApis
         | Command::FetchContents
         | Command::FetchVersions { .. }
-        | Command::FetchReservation { .. }) => schedule_fetch(app, fetch, tx),
+        | Command::FetchReservation { .. }
+        | Command::FetchMembers
+        | Command::FetchMemberDetail { .. }) => schedule_fetch(app, fetch, tx),
         Command::Create { template, status } => match edit_json(terminal, "create", &template) {
             Ok(EditResult::Changed(value)) => {
                 let value = sanitized_payload(&value);
@@ -652,7 +688,8 @@ fn queue_write_mutation(
                 MutationRequest::Update { .. } => "Updating draft content...".into(),
                 MutationRequest::Delete { .. }
                 | MutationRequest::Status { .. }
-                | MutationRequest::Reservation { .. } => {
+                | MutationRequest::Reservation { .. }
+                | MutationRequest::Creator { .. } => {
                     unreachable!("only content writes are queued here")
                 }
             });
@@ -737,6 +774,17 @@ fn schedule_confirmed_mutation(
                 stop_time,
             }
         }
+        PendingConfirmation::Creator {
+            content_id,
+            member_id,
+            ..
+        } => {
+            app.message = Some("Changing content creator...".into());
+            MutationRequest::Creator {
+                content_id,
+                member_id,
+            }
+        }
     };
     schedule_mutation(app, mutation, tx);
 }
@@ -776,10 +824,15 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
     let needs_schema = should_fetch_schema(app, endpoint.as_deref());
     let is_version_fetch = matches!(&command, Command::FetchVersions { .. });
     let is_reservation_fetch = matches!(&command, Command::FetchReservation { .. });
+    let is_member_fetch = matches!(
+        &command,
+        Command::FetchMembers | Command::FetchMemberDetail { .. }
+    );
     let auxiliary_content_id = match &command {
         Command::FetchVersions { content_id } | Command::FetchReservation { content_id } => {
             content_id.clone()
         }
+        Command::FetchMemberDetail { member_id } => member_id.clone(),
         _ => String::new(),
     };
     let failure_endpoint = match &command {
@@ -906,6 +959,16 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                         reservations,
                     })
                 }
+                Command::FetchMembers => {
+                    let members = client.list_members().await?;
+                    Ok(AppEvent::MembersLoaded {
+                        members: members.members,
+                        total_count: members.total_count,
+                    })
+                }
+                Command::FetchMemberDetail { member_id } => Ok(AppEvent::MemberDetailLoaded(
+                    client.get_member(&member_id).await?,
+                )),
                 Command::FetchVersions { content_id } => {
                     let endpoint = endpoint.context("endpoint is missing")?;
                     let metadata = client.get_content_metadata(&endpoint, &content_id).await?;
@@ -962,6 +1025,7 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                 content_id: auxiliary_content_id,
                 error: format!("{error:#}"),
             },
+            Err(error) if is_member_fetch => AppEvent::MembersFailed(format!("{error:#}")),
             Err(error) => AppEvent::FetchFailed {
                 endpoint: failure_endpoint,
                 error: format!("{error:#}"),
@@ -1112,6 +1176,18 @@ fn schedule_mutation(app: &App, mutation: MutationRequest, tx: mpsc::UnboundedSe
                         } else {
                             "Publication reservation updated; page reloaded.".into()
                         },
+                    })
+                }
+                MutationRequest::Creator {
+                    content_id,
+                    member_id,
+                } => {
+                    client
+                        .update_content_creator(&endpoint, &content_id, &member_id)
+                        .await?;
+                    Ok(AppEvent::MutationSucceeded {
+                        endpoint: endpoint.clone(),
+                        message: "Content creator changed; page reloaded.".into(),
                     })
                 }
             }
@@ -1369,6 +1445,28 @@ mod tests {
         assert_eq!(
             action_for_key(key(KeyCode::Enter), &app),
             Some(Action::Select)
+        );
+    }
+
+    #[test]
+    fn member_keys_open_browser_fetch_detail_and_change_creator() {
+        let mut app = App::new(Config::default());
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('M')), &app),
+            Some(Action::OpenMembers)
+        );
+
+        app.screen = Screen::Members;
+        assert_eq!(
+            action_for_key(key(KeyCode::Enter), &app),
+            Some(Action::FetchMemberDetail)
+        );
+        assert_eq!(action_for_key(key(KeyCode::Esc), &app), Some(Action::Back));
+
+        app.screen = Screen::ContentBrowser;
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('m')), &app),
+            Some(Action::ChangeCreator)
         );
     }
 
@@ -1707,7 +1805,7 @@ mod tests {
             Some(Action::EditDraftKey)
         );
         assert_eq!(
-            action_for_key(key(KeyCode::Char('m')), &app),
+            action_for_key(key(KeyCode::Char('F')), &app),
             Some(Action::EditRichEditorFormat)
         );
 

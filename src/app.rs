@@ -6,8 +6,8 @@ use serde_json::Value;
 use crate::{
     config::Config,
     microcms::{
-        ApiInfo, ContentCollection, ContentCollectionKind, ContentWriteStatus, PublicationStatus,
-        ReservationTime,
+        ApiInfo, ContentCollection, ContentCollectionKind, ContentWriteStatus, MemberInfo,
+        PublicationStatus, ReservationTime,
     },
 };
 
@@ -25,6 +25,7 @@ const SYSTEM_METADATA_FIELDS: [&str; 6] = [
 pub enum Screen {
     EndpointPicker,
     ContentBrowser,
+    Members,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +108,12 @@ pub struct VersionComparison {
     pub scroll: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberPicker {
+    pub content_id: String,
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentPublicationState {
     Published,
@@ -144,6 +151,11 @@ pub enum PendingConfirmation {
         publish_time: Option<String>,
         stop_time: Option<String>,
     },
+    Creator {
+        content_id: String,
+        member_id: String,
+        member_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +172,13 @@ pub enum LoadState {
 pub struct App {
     pub config: Config,
     pub service_name: Option<String>,
+    pub members: Vec<MemberInfo>,
+    pub members_total_count: usize,
+    pub member_selected: usize,
+    pub member_detail: Option<MemberInfo>,
+    pub members_loading: bool,
+    pub member_picker: Option<MemberPicker>,
+    pub member_return_screen: Screen,
     pub apis: Vec<ApiInfo>,
     pub api_selected: usize,
     pub endpoint: Option<String>,
@@ -211,6 +230,14 @@ pub enum Action {
     MoveUp,
     SelectApiAt(usize),
     SelectContentAt(usize),
+    SelectMemberAt(usize),
+    OpenMembers,
+    FetchMemberDetail,
+    ChangeCreator,
+    MemberPickerMoveDown,
+    MemberPickerMoveUp,
+    MemberPickerConfirm,
+    MemberPickerCancel,
     ToggleSelect,
     Select,
     Reload,
@@ -282,6 +309,10 @@ pub enum Command {
     FetchReservation {
         content_id: String,
     },
+    FetchMembers,
+    FetchMemberDetail {
+        member_id: String,
+    },
     Create {
         template: Value,
         status: ContentWriteStatus,
@@ -306,6 +337,12 @@ pub enum AppEvent {
         service_name: Option<String>,
         service_warning: Option<String>,
     },
+    MembersLoaded {
+        members: Vec<MemberInfo>,
+        total_count: usize,
+    },
+    MemberDetailLoaded(MemberInfo),
+    MembersFailed(String),
     ContentsLoaded {
         endpoint: String,
         collection: ContentCollection,
@@ -376,6 +413,13 @@ impl App {
         Self {
             config,
             service_name: None,
+            members: Vec::new(),
+            members_total_count: 0,
+            member_selected: 0,
+            member_detail: None,
+            members_loading: false,
+            member_picker: None,
+            member_return_screen: Screen::EndpointPicker,
             apis: Vec::new(),
             api_selected: 0,
             endpoint,
@@ -426,7 +470,11 @@ impl App {
             Action::ToggleHelp => self.help_open = !self.help_open,
             Action::CloseHelp => self.help_open = false,
             Action::Back => {
-                if self.screen == Screen::ContentBrowser {
+                if self.screen == Screen::Members {
+                    self.screen = self.member_return_screen;
+                    self.member_detail = None;
+                    self.message = None;
+                } else if self.screen == Screen::ContentBrowser {
                     self.help_open = false;
                     self.close_preview();
                     self.screen = Screen::EndpointPicker;
@@ -453,6 +501,12 @@ impl App {
                         self.preview_scroll = 0;
                     }
                 }
+                Screen::Members => {
+                    if self.member_selected + 1 < self.members.len() {
+                        self.member_selected += 1;
+                        self.member_detail = None;
+                    }
+                }
             },
             Action::MoveUp => match self.screen {
                 Screen::EndpointPicker => {
@@ -461,6 +515,10 @@ impl App {
                 Screen::ContentBrowser => {
                     self.content_selected = self.content_selected.saturating_sub(1);
                     self.preview_scroll = 0;
+                }
+                Screen::Members => {
+                    self.member_selected = self.member_selected.saturating_sub(1);
+                    self.member_detail = None;
                 }
             },
             Action::SelectApiAt(index) => {
@@ -476,6 +534,85 @@ impl App {
                     self.content_selected = index;
                     self.preview_scroll = 0;
                 }
+            }
+            Action::SelectMemberAt(index) => {
+                if self.screen == Screen::Members && index < self.members.len() {
+                    self.member_selected = index;
+                    self.member_detail = None;
+                }
+            }
+            Action::OpenMembers => {
+                if self.screen != Screen::Members {
+                    self.member_return_screen = self.screen;
+                }
+                self.close_preview();
+                self.screen = Screen::Members;
+                self.member_detail = None;
+                self.members_loading = true;
+                self.message = Some("Loading members...".into());
+                return Command::FetchMembers;
+            }
+            Action::FetchMemberDetail => {
+                if self.screen == Screen::Members {
+                    if let Some(member) = self.members.get(self.member_selected) {
+                        self.members_loading = true;
+                        self.message = Some("Loading member detail...".into());
+                        return Command::FetchMemberDetail {
+                            member_id: member.id.clone(),
+                        };
+                    }
+                }
+            }
+            Action::ChangeCreator => {
+                if self.is_object_api() {
+                    self.message = Some("Object API creator changes are not supported.".into());
+                    return Command::None;
+                }
+                let Some(content_id) = self.selected_content_id() else {
+                    self.message =
+                        Some("Selected content has no id or _id; cannot change creator.".into());
+                    return Command::None;
+                };
+                self.member_picker = Some(MemberPicker {
+                    content_id,
+                    selected: 0,
+                });
+                if self.members.is_empty() {
+                    self.members_loading = true;
+                    self.message = Some("Loading members...".into());
+                    return Command::FetchMembers;
+                }
+                self.message = None;
+            }
+            Action::MemberPickerMoveDown => {
+                if let Some(picker) = self.member_picker.as_mut() {
+                    if picker.selected + 1 < self.members.len() {
+                        picker.selected += 1;
+                    }
+                }
+            }
+            Action::MemberPickerMoveUp => {
+                if let Some(picker) = self.member_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            Action::MemberPickerConfirm => {
+                if let Some(picker) = self.member_picker.take() {
+                    if let Some(member) = self.members.get(picker.selected) {
+                        self.pending_confirmation = Some(PendingConfirmation::Creator {
+                            content_id: picker.content_id,
+                            member_id: member.id.clone(),
+                            member_name: member_display_name(member),
+                        });
+                        self.message = Some("Confirm content creator change.".into());
+                    } else {
+                        self.message = Some("No member selected.".into());
+                    }
+                }
+            }
+            Action::MemberPickerCancel => {
+                self.member_picker = None;
+                self.message = Some("Creator change cancelled.".into());
             }
             Action::ToggleSelect => {
                 if self.is_object_api() {
@@ -562,6 +699,12 @@ impl App {
                     self.state = LoadState::LoadingContents;
                     self.message = None;
                     return Command::FetchContents;
+                }
+                Screen::Members => {
+                    self.members_loading = true;
+                    self.member_detail = None;
+                    self.message = Some("Loading members...".into());
+                    return Command::FetchMembers;
                 }
                 _ => {}
             },
@@ -1075,6 +1218,46 @@ impl App {
                 self.screen = Screen::EndpointPicker;
                 self.state = LoadState::ApisLoaded;
                 self.message = service_warning;
+            }
+            AppEvent::MembersLoaded {
+                members,
+                total_count,
+            } => {
+                if self.screen == Screen::Members || self.member_picker.is_some() {
+                    self.members = members;
+                    self.members_total_count = total_count;
+                    self.member_selected = self
+                        .member_selected
+                        .min(self.members.len().saturating_sub(1));
+                    if let Some(picker) = self.member_picker.as_mut() {
+                        picker.selected = picker.selected.min(self.members.len().saturating_sub(1));
+                    }
+                    self.members_loading = false;
+                    self.message = if self.members.is_empty() {
+                        Some("No members found.".into())
+                    } else {
+                        None
+                    };
+                }
+            }
+            AppEvent::MemberDetailLoaded(member) => {
+                let current_id = self
+                    .members
+                    .get(self.member_selected)
+                    .map(|item| item.id.as_str());
+                if self.screen == Screen::Members {
+                    self.members_loading = false;
+                    if current_id == Some(member.id.as_str()) {
+                        self.member_detail = Some(member);
+                        self.message = Some("Member detail loaded.".into());
+                    }
+                }
+            }
+            AppEvent::MembersFailed(error) => {
+                if self.screen == Screen::Members || self.member_picker.is_some() {
+                    self.members_loading = false;
+                    self.message = Some(format!("error: {error}"));
+                }
             }
             AppEvent::ContentsLoaded {
                 endpoint,
@@ -1933,6 +2116,14 @@ pub fn content_label(value: &Value, field_order: &[String]) -> String {
 
     let compact = serde_json::to_string(value).unwrap_or_else(|_| "<invalid JSON>".to_string());
     truncate_chars(&compact, 80)
+}
+
+pub fn member_display_name(member: &MemberInfo) -> String {
+    if member.name.trim().is_empty() {
+        member.email.clone()
+    } else {
+        format!("{} - {}", member.name, member.email)
+    }
 }
 
 fn displayable_label(value: &Value) -> Option<String> {
@@ -3590,6 +3781,54 @@ mod tests {
             "first,second,third,fourth"
         );
         assert_eq!(normalize_ids("  ,  "), "");
+    }
+
+    #[test]
+    fn member_browser_and_creator_picker_follow_existing_command_flow() {
+        let mut app = App::new(credentials_only_config());
+        assert_eq!(app.apply_action(Action::OpenMembers), Command::FetchMembers);
+        assert_eq!(app.screen, Screen::Members);
+
+        let member = MemberInfo {
+            id: "member-1".into(),
+            name: "Editor".into(),
+            email: "editor@example.com".into(),
+            mfa: true,
+            inviting: false,
+            last_accessed_at: None,
+        };
+        app.apply_event(AppEvent::MembersLoaded {
+            members: vec![member.clone()],
+            total_count: 1,
+        });
+        assert_eq!(
+            app.apply_action(Action::FetchMemberDetail),
+            Command::FetchMemberDetail {
+                member_id: "member-1".into()
+            }
+        );
+        app.apply_event(AppEvent::MemberDetailLoaded(member.clone()));
+        assert_eq!(app.member_detail, Some(member.clone()));
+
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.endpoint = Some("blogs".into());
+        app.items = vec![json!({"id": "content-1"})];
+        assert_eq!(app.apply_action(Action::ChangeCreator), Command::None);
+        assert!(app.member_picker.is_some());
+        app.apply_action(Action::MemberPickerConfirm);
+        assert_eq!(
+            app.pending_confirmation,
+            Some(PendingConfirmation::Creator {
+                content_id: "content-1".into(),
+                member_id: "member-1".into(),
+                member_name: "Editor - editor@example.com".into(),
+            })
+        );
+        assert!(matches!(
+            app.apply_action(Action::ConfirmPending),
+            Command::Confirmed(PendingConfirmation::Creator { .. })
+        ));
     }
 
     #[test]
