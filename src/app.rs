@@ -208,6 +208,8 @@ pub enum Action {
     Back,
     MoveDown,
     MoveUp,
+    SelectApiAt(usize),
+    SelectContentAt(usize),
     ToggleSelect,
     Select,
     Reload,
@@ -232,6 +234,7 @@ pub enum Action {
     EditRichEditorFormat,
     QuerySelectorMoveDown,
     QuerySelectorMoveUp,
+    QuerySelectorChoose(usize),
     QuerySelectorToggle,
     QuerySelectorApply,
     QuerySelectorCancel,
@@ -441,6 +444,7 @@ impl App {
                 Screen::ContentBrowser => {
                     if self.content_selected + 1 < self.items.len() {
                         self.content_selected += 1;
+                        self.preview_scroll = 0;
                     }
                 }
             },
@@ -450,8 +454,23 @@ impl App {
                 }
                 Screen::ContentBrowser => {
                     self.content_selected = self.content_selected.saturating_sub(1);
+                    self.preview_scroll = 0;
                 }
             },
+            Action::SelectApiAt(index) => {
+                if self.screen == Screen::EndpointPicker && index < self.apis.len() {
+                    self.api_selected = index;
+                }
+            }
+            Action::SelectContentAt(index) => {
+                if self.screen == Screen::ContentBrowser
+                    && !self.is_object_api()
+                    && index < self.items.len()
+                {
+                    self.content_selected = index;
+                    self.preview_scroll = 0;
+                }
+            }
             Action::ToggleSelect => {
                 if self.is_object_api() {
                     self.message = Some("Object API does not support bulk selection.".into());
@@ -594,22 +613,22 @@ impl App {
             }
             Action::ClosePreviewFullscreen => self.close_preview(),
             Action::PreviewScrollDown => {
-                if self.preview_fullscreen || self.is_object_api() {
+                if self.screen == Screen::ContentBrowser {
                     self.preview_scroll = self.preview_scroll.saturating_add(1);
                 }
             }
             Action::PreviewScrollUp => {
-                if self.preview_fullscreen || self.is_object_api() {
+                if self.screen == Screen::ContentBrowser {
                     self.preview_scroll = self.preview_scroll.saturating_sub(1);
                 }
             }
             Action::PreviewScrollTop => {
-                if self.preview_fullscreen || self.is_object_api() {
+                if self.screen == Screen::ContentBrowser {
                     self.preview_scroll = 0;
                 }
             }
             Action::PreviewScrollBottom => {
-                if self.preview_fullscreen || self.is_object_api() {
+                if self.screen == Screen::ContentBrowser {
                     self.preview_scroll = u16::MAX;
                 }
             }
@@ -767,6 +786,25 @@ impl App {
                         | QuerySelector::RichEditorFormat { cursor } => cursor,
                     };
                     *cursor = cursor.saturating_sub(1);
+                }
+            }
+            Action::QuerySelectorChoose(index) => {
+                if let Some(selector) = self.query_selector.as_mut() {
+                    match selector {
+                        QuerySelector::Fields { cursor, selected } => {
+                            if let Some(field) = self.content_field_order.get(index) {
+                                *cursor = index;
+                                if !selected.remove(field) {
+                                    selected.insert(field.clone());
+                                }
+                            }
+                        }
+                        QuerySelector::Depth { cursor } if index <= 4 => *cursor = index,
+                        QuerySelector::RichEditorFormat { cursor } if index <= 2 => {
+                            *cursor = index;
+                        }
+                        _ => {}
+                    }
                 }
             }
             Action::QuerySelectorToggle => {

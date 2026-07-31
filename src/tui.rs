@@ -8,11 +8,18 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    Terminal,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -114,7 +121,7 @@ pub fn run(config: Config) -> Result<()> {
 fn setup_terminal() -> Result<TuiTerminal> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
         let _ = disable_raw_mode();
         return Err(error).context("failed to enter alternate screen");
     }
@@ -128,7 +135,7 @@ fn setup_terminal() -> Result<TuiTerminal> {
         }
         Err(error) => {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             Err(error).context("failed to initialize terminal")
         }
@@ -137,15 +144,23 @@ fn setup_terminal() -> Result<TuiTerminal> {
 
 fn restore_terminal(terminal: &mut TuiTerminal) -> Result<()> {
     let raw_result = disable_raw_mode().context("failed to disable terminal raw mode");
-    let screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen");
+    let screen_result = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .context("failed to leave alternate screen");
     let cursor_result = terminal.show_cursor().context("failed to show cursor");
     raw_result.and(screen_result).and(cursor_result)
 }
 
 fn resume_terminal(terminal: &mut TuiTerminal) -> Result<()> {
     enable_raw_mode().context("failed to re-enable terminal raw mode")?;
-    if let Err(error) = execute!(terminal.backend_mut(), EnterAlternateScreen) {
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
         let _ = disable_raw_mode();
         return Err(error).context("failed to re-enter alternate screen");
     }
@@ -172,18 +187,184 @@ fn run_loop(terminal: &mut TuiTerminal, config: Config) -> Result<()> {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(50)).context("failed to poll terminal events")? {
-            if let Event::Key(key) = event::read().context("failed to read terminal event")? {
-                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
+            let terminal_event = event::read().context("failed to read terminal event")?;
+            let action = match terminal_event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    action_for_key(key, &app)
                 }
-                if let Some(action) = action_for_key(key, &app) {
-                    let command = app.apply_action(action);
-                    handle_command(terminal, &mut app, command, tx.clone());
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    action_for_mouse(mouse, &app, Rect::new(0, 0, size.width, size.height))
                 }
+                _ => None,
+            };
+            if let Some(action) = action {
+                let command = app.apply_action(action);
+                handle_command(terminal, &mut app, command, tx.clone());
             }
         }
     }
     Ok(())
+}
+
+fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option<Action> {
+    if app.help_open
+        || app.input_target.is_some()
+        || app.reservation_input.is_some()
+        || app.pending_confirmation.is_some()
+        || app.version_comparison.is_some()
+    {
+        return None;
+    }
+
+    if app.query_selector.is_some() {
+        return match mouse.kind {
+            MouseEventKind::ScrollDown => Some(Action::QuerySelectorMoveDown),
+            MouseEventKind::ScrollUp => Some(Action::QuerySelectorMoveUp),
+            MouseEventKind::Down(MouseButton::Left) => {
+                query_selector_index_at(app, terminal_area, mouse.column, mouse.row)
+                    .map(Action::QuerySelectorChoose)
+            }
+            _ => None,
+        };
+    }
+
+    if app.screen == Screen::ContentBrowser
+        && (app.preview_fullscreen || app.content_kind == ContentCollectionKind::Object)
+    {
+        return match mouse.kind {
+            MouseEventKind::ScrollDown => Some(Action::PreviewScrollDown),
+            MouseEventKind::ScrollUp => Some(Action::PreviewScrollUp),
+            _ => None,
+        };
+    }
+
+    let main = main_area(terminal_area);
+    let columns = match app.screen {
+        Screen::EndpointPicker => horizontal_columns(main, 60),
+        Screen::ContentBrowser => horizontal_columns(main, 40),
+    };
+    let list_area = columns[0];
+    if app.screen == Screen::ContentBrowser && rect_contains(columns[1], mouse.column, mouse.row) {
+        return match mouse.kind {
+            MouseEventKind::ScrollDown => Some(Action::PreviewScrollDown),
+            MouseEventKind::ScrollUp => Some(Action::PreviewScrollUp),
+            _ => None,
+        };
+    }
+    if !rect_contains(list_area, mouse.column, mouse.row) {
+        return None;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollDown => Some(Action::MoveDown),
+        MouseEventKind::ScrollUp => Some(Action::MoveUp),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let (selected, len) = match app.screen {
+                Screen::EndpointPicker => (app.api_selected, app.apis.len()),
+                Screen::ContentBrowser => (app.content_selected, app.items.len()),
+            };
+            list_index_at(list_area, selected, len, mouse.column, mouse.row).map(|index| {
+                if app.screen == Screen::EndpointPicker {
+                    Action::SelectApiAt(index)
+                } else {
+                    Action::SelectContentAt(index)
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+fn main_area(area: Rect) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area)[1]
+}
+
+fn horizontal_columns(area: Rect, left_percent: u16) -> [Rect; 2] {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(left_percent),
+            Constraint::Percentage(100 - left_percent),
+        ])
+        .split(area);
+    [columns[0], columns[1]]
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn list_index_at(area: Rect, selected: usize, len: usize, column: u16, row: u16) -> Option<usize> {
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if !rect_contains(inner, column, row) || len == 0 {
+        return None;
+    }
+    let visible_rows = inner.height as usize;
+    let first = selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows.max(1));
+    let index = first + usize::from(row - inner.y);
+    (index < len).then_some(index)
+}
+
+fn query_selector_index_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
+    let (cursor, len) = match app.query_selector.as_ref()? {
+        crate::app::QuerySelector::Fields { cursor, .. } => {
+            (*cursor, app.content_field_order.len())
+        }
+        crate::app::QuerySelector::Depth { cursor } => (*cursor, 5),
+        crate::app::QuerySelector::RichEditorFormat { cursor } => (*cursor, 3),
+    };
+    let height = (len as u16 + 2).clamp(5, 20);
+    let modal = centered_modal_rect(area, 64, height, 72);
+    let visible_rows = modal.height.saturating_sub(2) as usize;
+    let first = cursor.saturating_add(1).saturating_sub(visible_rows.max(1));
+    let inner = Rect::new(
+        modal.x.saturating_add(1),
+        modal.y.saturating_add(1),
+        modal.width.saturating_sub(2),
+        modal.height.saturating_sub(2),
+    );
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+    let index = first + usize::from(row - inner.y);
+    (index < len).then_some(index)
+}
+
+fn centered_modal_rect(area: Rect, percent_width: u16, height: u16, max_width: u16) -> Rect {
+    let width = area
+        .width
+        .saturating_mul(percent_width)
+        .checked_div(100)
+        .unwrap_or(area.width)
+        .min(max_width)
+        .max(1)
+        .min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
@@ -1036,6 +1217,96 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_click_selects_content_row_and_wheel_moves_lists() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.items = vec![json!({"id": "one"}), json!({"id": "two"})];
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+                &app,
+                area
+            ),
+            Some(Action::SelectContentAt(1))
+        );
+        assert_eq!(
+            action_for_mouse(mouse(MouseEventKind::ScrollDown, 2, 3), &app, area),
+            Some(Action::MoveDown)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_fullscreen_preview() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.preview_fullscreen = true;
+
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::ScrollDown, 40, 12),
+                &app,
+                Rect::new(0, 0, 80, 24)
+            ),
+            Some(Action::PreviewScrollDown)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_normal_json_preview_pane() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.items = vec![json!({"id": "one"})];
+
+        assert_eq!(
+            action_for_mouse(
+                mouse(MouseEventKind::ScrollDown, 60, 12),
+                &app,
+                Rect::new(0, 0, 80, 24)
+            ),
+            Some(Action::PreviewScrollDown)
+        );
+    }
+
+    #[test]
+    fn mouse_click_chooses_query_selector_row() {
+        let mut app = App::new(Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.content_field_order = vec!["title".into(), "body".into()];
+        app.query_selector = Some(crate::app::QuerySelector::Fields {
+            cursor: 0,
+            selected: Default::default(),
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let modal = centered_modal_rect(area, 64, 5, 72);
+
+        assert_eq!(
+            action_for_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    modal.x + 2,
+                    modal.y + 2
+                ),
+                &app,
+                area
+            ),
+            Some(Action::QuerySelectorChoose(1))
+        );
     }
 
     #[test]

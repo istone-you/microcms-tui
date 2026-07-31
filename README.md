@@ -58,6 +58,7 @@ Endpoint picker:
 - `j`/`Down` and `k`/`Up`: move selection
 - `Enter`: browse the selected endpoint
 - `r`: reload available APIs
+- Mouse: click a row to select it; use the wheel over the list to move selection
 
 Content browser:
 
@@ -88,6 +89,7 @@ Content browser:
 - `D`: return all marked contents to draft, or the current content when none are marked
 - `s`: view or edit the selected content's publication reservation
 - `v`: compare the selected content's published and draft versions
+- Mouse: click a content row to select it; use the wheel over the list to move selection
 
 Fullscreen JSON preview:
 
@@ -102,6 +104,8 @@ Fullscreen JSON preview:
 - `v`: compare the displayed content's published and draft versions
 
 Selection, create, query, endpoint navigation, and page-fetch actions are disabled while the fullscreen preview is open.
+
+The mouse wheel scrolls the normal, fullscreen, and Object API JSON previews. Schema-backed query selectors also accept row clicks and wheel movement. Mouse capture is enabled while the TUI is active; terminals commonly require holding `Shift` when selecting text for copy.
 
 Uppercase `C`, `U`, and `E` are thin wrappers over the Content API `status=draft` query. `D` is different: it changes publication status through the Management API, while `E` sends a Content API PATCH with `status=draft`.
 

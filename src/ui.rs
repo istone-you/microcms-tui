@@ -1,11 +1,12 @@
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     content_id, content_label, ordered_content_for_display, App, ContentPublicationState,
@@ -375,7 +376,6 @@ fn content_status_marker(
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect, fullscreen: bool) {
     let object = app.content_kind == ContentCollectionKind::Object;
-    let scrollable = fullscreen || object;
     let preview = app
         .items
         .get(app.content_selected)
@@ -391,7 +391,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect, fullscreen: bool) {
             } else {
                 "JSON preview"
             }))
-            .scroll((if scrollable { app.preview_scroll } else { 0 }, 0))
+            .scroll((app.preview_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -477,7 +477,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("  s publication reservation   v published/draft comparison"),
         ])
     };
-    frame.render_widget(Clear, area);
+    clear_modal_background(frame, area);
     frame.render_widget(
         Paragraph::new(help)
             .style(modal_style())
@@ -508,7 +508,7 @@ fn draw_input_modal(frame: &mut Frame, app: &App) {
     let area = centered_modal(frame.area(), 70, 3);
     let inner_width = area.width.saturating_sub(2) as usize;
     let (input, cursor_column) = visible_input(&app.input_buffer, app.input_cursor, inner_width);
-    frame.render_widget(Clear, area);
+    clear_modal_background(frame, area);
     frame.render_widget(
         Paragraph::new(input)
             .style(modal_style())
@@ -589,7 +589,7 @@ fn draw_query_selector_modal(frame: &mut Frame, app: &App) {
             }
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Clear, area);
+    clear_modal_background(frame, area);
     frame.render_widget(
         Paragraph::new(visible).style(modal_style()).block(
             Block::default()
@@ -644,7 +644,7 @@ fn draw_reservation_modal(frame: &mut Frame, app: &App) {
         Line::from(rule),
         Line::from("Tab field | Enter review | F8 clear | Esc cancel"),
     ]);
-    frame.render_widget(Clear, area);
+    clear_modal_background(frame, area);
     frame.render_widget(
         Paragraph::new(text)
             .style(modal_style())
@@ -748,7 +748,7 @@ fn draw_version_comparison(frame: &mut Frame, app: &App) {
             .unwrap_or_else(|error| format!("Failed to render JSON: {error}")),
         ),
     };
-    frame.render_widget(Clear, area);
+    clear_modal_background(frame, area);
     frame.render_widget(
         Paragraph::new(body)
             .style(modal_style())
@@ -778,7 +778,7 @@ fn draw_confirmation_modal(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from("y confirm | n/Esc cancel"),
     ]);
-    frame.render_widget(Clear, area);
+    clear_modal_background(frame, area);
     frame.render_widget(
         Paragraph::new(confirmation)
             .style(modal_style())
@@ -884,6 +884,34 @@ fn centered_modal(area: Rect, percent_width: u16, height: u16) -> Rect {
 
 fn modal_style() -> Style {
     Style::default().fg(Color::White).bg(Color::Black)
+}
+
+fn clear_modal_background(frame: &mut Frame, area: Rect) {
+    let frame_area = frame.area();
+    clear_wide_char_crossing_left_border(frame.buffer_mut(), frame_area, area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(modal_style()), area);
+}
+
+fn clear_wide_char_crossing_left_border(buffer: &mut Buffer, frame_area: Rect, modal_area: Rect) {
+    if modal_area.x <= frame_area.x {
+        return;
+    }
+    let scan_start = modal_area.x.saturating_sub(4).max(frame_area.x);
+    let bottom = modal_area
+        .y
+        .saturating_add(modal_area.height)
+        .min(frame_area.y.saturating_add(frame_area.height));
+    for y in modal_area.y..bottom {
+        for x in scan_start..modal_area.x {
+            let width = UnicodeWidthStr::width(buffer[(x, y)].symbol()) as u16;
+            if width > 1 && x.saturating_add(width) > modal_area.x {
+                for occupied_x in x..modal_area.x {
+                    buffer[(occupied_x, y)].reset();
+                }
+            }
+        }
+    }
 }
 
 fn centered_modal_with_max_width(
@@ -1042,6 +1070,48 @@ mod tests {
         assert_eq!(right_border.bg, Color::Black);
         let interior = buffer.cell((area.x + 1, area.y + 1)).unwrap();
         assert_eq!(interior.bg, Color::Black);
+    }
+
+    #[test]
+    fn modal_boundary_repairs_hiragana_katakana_and_kanji_without_moving_the_boundary() {
+        let frame = Rect::new(0, 0, 20, 4);
+        let modal = Rect::new(10, 1, 8, 2);
+
+        for glyph in ["あ", "カ", "漢"] {
+            let mut buffer = Buffer::empty(frame);
+            buffer.set_string(modal.x - 1, modal.y, glyph, Style::default());
+            clear_wide_char_crossing_left_border(&mut buffer, frame, modal);
+            assert_eq!(buffer[(modal.x - 1, modal.y)].symbol(), " ", "{glyph}");
+        }
+
+        let mut buffer = Buffer::empty(frame);
+        buffer.set_string(modal.x - 1, modal.y, "a", Style::default());
+        clear_wide_char_crossing_left_border(&mut buffer, frame, modal);
+        assert_eq!(buffer[(modal.x - 1, modal.y)].symbol(), "a");
+    }
+
+    #[test]
+    fn modal_keeps_non_overlapping_text_and_draws_its_left_border() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::ContentBrowser;
+        app.state = LoadState::ContentsLoaded;
+        app.content_field_order = vec!["body".into()];
+        app.items = (0..12)
+            .map(|index| serde_json::json!({"id": format!("id-{index}"), "body": "あいうえおかきくけこ"}))
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        app.input_target = Some(InputTarget::Search);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let modal = centered_modal(Rect::new(0, 0, 80, 24), 70, 3);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer.cell((modal.x - 1, modal.y + 1)).unwrap().symbol(),
+            "0"
+        );
+        assert_eq!(buffer.cell((modal.x, modal.y + 1)).unwrap().symbol(), "│");
     }
 
     #[test]
