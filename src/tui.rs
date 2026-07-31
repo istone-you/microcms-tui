@@ -796,7 +796,22 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
             let client = MicroCmsClient::new(service_id, api_key)?;
 
             match command {
-                Command::FetchApis => Ok(AppEvent::ApisLoaded(client.list_apis().await?.apis)),
+                Command::FetchApis => {
+                    let (apis, service) = tokio::join!(client.list_apis(), client.get_service_info());
+                    let apis = apis?.apis;
+                    let (service_name, service_warning) = match service {
+                        Ok(service) => (Some(service.name), None),
+                        Err(error) => (
+                            None,
+                            Some(format!("Service name unavailable: {error:#}")),
+                        ),
+                    };
+                    Ok(AppEvent::ApisLoaded {
+                        apis,
+                        service_name,
+                        service_warning,
+                    })
+                }
                 Command::FetchContents => {
                     let endpoint = endpoint.context("endpoint is missing")?;
                     let collection = client

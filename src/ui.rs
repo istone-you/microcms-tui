@@ -60,14 +60,26 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn picker_status(app: &App) -> String {
-    let state = match &app.state {
+    let mut state = match &app.state {
         LoadState::MissingConfig(_) => "missing configuration".to_string(),
         LoadState::LoadingApis => "loading...".to_string(),
         LoadState::ApisLoaded => format!("{} available", app.apis.len()),
         LoadState::Error(error) => format!("error: {error}"),
         _ => format!("{} available", app.apis.len()),
     };
-    format!(" microcms-tui | APIs | {state}")
+    if let Some(message) = &app.message {
+        state.push_str(" | ");
+        state.push_str(&truncate_inline(message, 60));
+    }
+    let service_id = app.config.service_id.as_deref().unwrap_or("<not set>");
+    let service_name = app.service_name.as_deref().unwrap_or_else(|| {
+        if matches!(app.state, LoadState::LoadingApis) {
+            "loading..."
+        } else {
+            "<unavailable>"
+        }
+    });
+    format!(" microcms-tui | service: {service_name} | id: {service_id} | APIs | {state}")
 }
 
 fn content_status(app: &App) -> String {
@@ -1039,6 +1051,21 @@ mod tests {
             footer_text(&app),
             " j/k move | Space toggle | Enter apply | Esc cancel"
         );
+    }
+
+    #[test]
+    fn endpoint_header_shows_service_name_and_id() {
+        let mut app = App::new(crate::config::Config {
+            service_id: Some("service-id".into()),
+            api_key: Some("key".into()),
+            endpoint: None,
+        });
+        app.service_name = Some("Example Service".into());
+        app.state = LoadState::ApisLoaded;
+
+        let status = picker_status(&app);
+        assert!(status.contains("service: Example Service"));
+        assert!(status.contains("id: service-id"));
     }
 
     #[test]

@@ -15,6 +15,11 @@ pub struct ApiList {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceInfo {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiInfo {
     pub endpoint: String,
     pub name: Option<String>,
@@ -174,6 +179,12 @@ impl MicroCmsClient {
         let url = format!("{}/api/v1/apis", self.management_api_url);
         let value = self.get(url).await?;
         parse_api_list(value)
+    }
+
+    pub async fn get_service_info(&self) -> Result<ServiceInfo> {
+        let url = format!("{}/api/v1/service", self.management_api_url);
+        let value = self.get(url).await?;
+        parse_service_info(value)
     }
 
     pub async fn get_api_schema(&self, endpoint: &str) -> Result<Value> {
@@ -482,7 +493,7 @@ impl MicroCmsClient {
         response
             .json()
             .await
-            .context("failed to decode the microCMS API list response")
+            .context("failed to decode the microCMS Management API response")
     }
 }
 
@@ -678,6 +689,19 @@ fn parse_api_list(value: Value) -> Result<ApiList> {
         })
         .collect();
     Ok(ApiList { apis })
+}
+
+fn parse_service_info(value: Value) -> Result<ServiceInfo> {
+    let name = value
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .context("microCMS service response does not contain a nonempty 'name'")?;
+    Ok(ServiceInfo {
+        name: name.to_string(),
+    })
 }
 
 fn string_field<'a>(
@@ -993,5 +1017,17 @@ mod tests {
                 kind: None,
             }]
         );
+    }
+
+    #[test]
+    fn parses_official_service_info_response() {
+        assert_eq!(
+            parse_service_info(json!({"name": "Test Service"})).unwrap(),
+            ServiceInfo {
+                name: "Test Service".into()
+            }
+        );
+        assert!(parse_service_info(json!({"name": "  "})).is_err());
+        assert!(parse_service_info(json!({})).is_err());
     }
 }

@@ -60,6 +60,8 @@ Endpoint picker:
 - `r`: reload available APIs
 - Mouse: click a row to select it; use the wheel over the list to move selection
 
+The endpoint picker header shows the configured service ID and the service name returned by Management API `GET /api/v1/service`. The API key needs the Management API **Retrieve Service Information** permission; endpoint browsing remains available if only the service-name request fails.
+
 Content browser:
 
 - `b` or `Esc`: return to the endpoint picker

@@ -159,6 +159,7 @@ pub enum LoadState {
 #[derive(Debug)]
 pub struct App {
     pub config: Config,
+    pub service_name: Option<String>,
     pub apis: Vec<ApiInfo>,
     pub api_selected: usize,
     pub endpoint: Option<String>,
@@ -300,7 +301,11 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum AppEvent {
-    ApisLoaded(Vec<ApiInfo>),
+    ApisLoaded {
+        apis: Vec<ApiInfo>,
+        service_name: Option<String>,
+        service_warning: Option<String>,
+    },
     ContentsLoaded {
         endpoint: String,
         collection: ContentCollection,
@@ -370,6 +375,7 @@ impl App {
         let endpoint = config.endpoint.clone();
         Self {
             config,
+            service_name: None,
             apis: Vec::new(),
             api_selected: 0,
             endpoint,
@@ -1049,13 +1055,18 @@ impl App {
 
     pub fn apply_event(&mut self, event: AppEvent) -> Command {
         match event {
-            AppEvent::ApisLoaded(apis) => {
+            AppEvent::ApisLoaded {
+                apis,
+                service_name,
+                service_warning,
+            } => {
                 self.help_open = false;
                 self.content_kind_cache.extend(
                     apis.iter()
                         .filter_map(|api| api.kind.map(|kind| (api.endpoint.clone(), kind))),
                 );
                 self.apis = apis;
+                self.service_name = service_name;
                 self.api_selected = self
                     .endpoint
                     .as_deref()
@@ -1063,6 +1074,7 @@ impl App {
                     .unwrap_or(0);
                 self.screen = Screen::EndpointPicker;
                 self.state = LoadState::ApisLoaded;
+                self.message = service_warning;
             }
             AppEvent::ContentsLoaded {
                 endpoint,
