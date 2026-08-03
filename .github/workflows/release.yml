@@ -1,0 +1,93 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Match tag to Cargo package version
+        shell: bash
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "microcms-tui") | .version')"
+          test "v${package_version}" = "${GITHUB_REF_NAME}"
+      - name: Test
+        run: cargo test --locked
+
+  build-unix:
+    name: Build ${{ matrix.release_name }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            release_name: linux-x64
+          - os: ubuntu-24.04-arm
+            release_name: linux-arm64
+          - os: macos-15-intel
+            release_name: macos-x64
+          - os: macos-15
+            release_name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Package binary
+        shell: bash
+        run: |
+          archive="microcms-tui-${GITHUB_REF_NAME}-${{ matrix.release_name }}.tar.gz"
+          tar -C target/release -czf "${archive}" microcms-tui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microcms-tui-${{ matrix.release_name }}
+          path: microcms-tui-${{ github.ref_name }}-${{ matrix.release_name }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows-x64
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Package binary
+        shell: pwsh
+        run: |
+          $archive = "microcms-tui-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Compress-Archive -Path "target/release/microcms-tui.exe" -DestinationPath $archive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microcms-tui-windows-x64
+          path: microcms-tui-${{ github.ref_name }}-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - build-unix
+      - build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum microcms-tui-* > SHA256SUMS
+      - name: Create release and upload binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"

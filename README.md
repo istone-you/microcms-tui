@@ -4,6 +4,16 @@
 
 ## Install and run
 
+Prebuilt binaries for macOS (Apple Silicon and Intel), Linux (ARM64 and x86_64),
+and Windows x86_64 are attached to each [GitHub Release](https://github.com/istone-you/microcms-tui/releases).
+Download the archive for your platform, extract it, and place `microcms-tui` (or
+`microcms-tui.exe`) somewhere on your `PATH`. The release also includes a
+`SHA256SUMS` file for checksum verification.
+
+Maintainers publish a release by updating the package version in `Cargo.toml`,
+committing it, and pushing the matching tag (for example, `v0.1.0`). The release
+workflow verifies that the tag and package version match before publishing.
+
 Only the service ID and API key are required at startup:
 
 ```sh
