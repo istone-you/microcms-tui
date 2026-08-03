@@ -10,7 +10,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 directories = "6"
 mime_guess = "2"
-ratatui = "0.29"
+ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
