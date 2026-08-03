@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct MicroCmsClient {
@@ -40,6 +41,85 @@ pub struct MemberList {
     pub total_count: usize,
     #[serde(default)]
     pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaInfo {
+    pub id: String,
+    pub url: String,
+    #[serde(default)]
+    pub width: Option<u64>,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default)]
+    pub alt: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<String>,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct MediaList {
+    pub media: Vec<MediaInfo>,
+    #[serde(rename = "totalCount")]
+    pub total_count: usize,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaQuery {
+    pub limit: usize,
+    pub image_only: bool,
+    pub file_name: Option<String>,
+    pub tags: Option<String>,
+    pub alt: Option<String>,
+}
+
+impl Default for MediaQuery {
+    fn default() -> Self {
+        Self {
+            limit: 100,
+            image_only: false,
+            file_name: None,
+            tags: None,
+            alt: None,
+        }
+    }
+}
+
+impl MediaQuery {
+    fn initial_query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = vec![("limit", self.limit.clamp(1, 100).to_string())];
+        if self.image_only {
+            pairs.push(("imageOnly", "true".into()));
+        }
+        for (key, value) in [
+            ("fileName", &self.file_name),
+            ("tags", &self.tags),
+            ("alt", &self.alt),
+        ] {
+            if let Some(value) = nonempty(value) {
+                pairs.push((key, value.to_string()));
+            }
+        }
+        pairs
+    }
+
+    fn query_pairs(&self, token: Option<&str>) -> Vec<(&'static str, String)> {
+        token
+            .filter(|token| !token.is_empty())
+            .map(|token| vec![("token", token.to_string())])
+            .unwrap_or_else(|| self.initial_query_pairs())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct MediaDeleteResponse {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +327,63 @@ impl MicroCmsClient {
         let value = self.get(url).await?;
         serde_json::from_value(value)
             .context("failed to decode the microCMS member detail response")
+    }
+
+    pub async fn list_media(&self, query: &MediaQuery, token: Option<&str>) -> Result<MediaList> {
+        let url = format!("{}/api/v2/media", self.management_api_url);
+        let pairs = query.query_pairs(token);
+        let pair_refs = pairs
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect::<Vec<_>>();
+        let value = self.get_with_query(url, &pair_refs).await?;
+        serde_json::from_value(value).context("failed to decode the microCMS media list response")
+    }
+
+    pub async fn upload_media(&self, path: &Path) -> Result<Value> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("media path has no valid file name")?;
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read media file {}", path.display()))?;
+        let mime = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name.to_string())
+            .mime_str(&mime)
+            .context("failed to set media MIME type")?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let url = format!("{}/api/v1/media", self.management_api_url);
+        let response = self
+            .http
+            .post(url)
+            .header("X-MICROCMS-API-KEY", &self.api_key)
+            .multipart(form)
+            .send()
+            .await
+            .context("microCMS media upload request failed")?;
+        response_json(response, "upload media").await
+    }
+
+    pub async fn delete_media(&self, url: &str) -> Result<MediaDeleteResponse> {
+        let url_value = url.trim();
+        if url_value.is_empty() {
+            bail!("media URL is missing or empty");
+        }
+        let endpoint = format!("{}/api/v2/media", self.management_api_url);
+        let response = self
+            .http
+            .delete(endpoint)
+            .header("X-MICROCMS-API-KEY", &self.api_key)
+            .query(&[("url", url_value)])
+            .send()
+            .await
+            .context("microCMS media delete request failed")?;
+        let value = response_json(response, "delete media").await?;
+        serde_json::from_value(value).context("failed to decode the microCMS delete media response")
     }
 
     pub async fn get_api_schema(&self, endpoint: &str) -> Result<Value> {
@@ -744,6 +881,22 @@ async fn send_mutation(request: reqwest::RequestBuilder, operation: &str) -> Res
     Ok(())
 }
 
+async fn response_json(response: reqwest::Response, operation: &str) -> Result<Value> {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<response body unavailable>".to_string());
+    if !status.is_success() {
+        bail!(
+            "microCMS returned HTTP {status} while attempting to {operation}: {}",
+            response_body_for_error(&body)
+        );
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("failed to decode the microCMS {operation} response"))
+}
+
 fn response_body_for_error(body: &str) -> String {
     body.to_string()
 }
@@ -1163,5 +1316,66 @@ mod tests {
             detail.last_accessed_at.as_deref(),
             Some("2026-01-01T00:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn parses_official_media_v2_shape() {
+        let list: MediaList = serde_json::from_value(json!({
+            "media": [{
+                "id": "media-id",
+                "url": "https://images.microcms-assets.io/assets/service/media/sample.png",
+                "width": 1200,
+                "height": 800,
+                "tags": ["sample"],
+                "createdAt": "2026-08-01T00:00:00Z",
+                "extra": true
+            }],
+            "totalCount": 1,
+            "token": "next-token"
+        }))
+        .unwrap();
+
+        assert_eq!(list.total_count, 1);
+        assert_eq!(list.token.as_deref(), Some("next-token"));
+        assert_eq!(list.media[0].id, "media-id");
+        assert_eq!(list.media[0].width, Some(1200));
+        assert_eq!(list.media[0].tags, vec!["sample"]);
+    }
+
+    #[test]
+    fn media_query_builds_only_configured_initial_parameters() {
+        let query = MediaQuery {
+            limit: 25,
+            image_only: true,
+            file_name: Some(" hero ".into()),
+            tags: Some("news,featured".into()),
+            alt: Some(" cat ".into()),
+        };
+        assert_eq!(
+            query.initial_query_pairs(),
+            vec![
+                ("limit", "25".into()),
+                ("imageOnly", "true".into()),
+                ("fileName", "hero".into()),
+                ("tags", "news,featured".into()),
+                ("alt", "cat".into()),
+            ]
+        );
+
+        assert_eq!(
+            MediaQuery::default().initial_query_pairs(),
+            vec![("limit", "100".into())]
+        );
+        assert_eq!(
+            query.query_pairs(Some("next-token")),
+            vec![("token", "next-token".into())]
+        );
+    }
+
+    #[test]
+    fn parses_official_delete_media_response() {
+        let response: MediaDeleteResponse =
+            serde_json::from_value(json!({"id": "deleted-media-id"})).unwrap();
+        assert_eq!(response.id, "deleted-media-id");
     }
 }

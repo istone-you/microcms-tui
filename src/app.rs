@@ -6,8 +6,8 @@ use serde_json::Value;
 use crate::{
     config::Config,
     microcms::{
-        ApiInfo, ContentCollection, ContentCollectionKind, ContentWriteStatus, MemberInfo,
-        PublicationStatus, ReservationTime,
+        ApiInfo, ContentCollection, ContentCollectionKind, ContentWriteStatus, MediaInfo,
+        MemberInfo, PublicationStatus, ReservationTime,
     },
 };
 
@@ -26,6 +26,7 @@ pub enum Screen {
     EndpointPicker,
     ContentBrowser,
     Members,
+    Media,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,11 @@ pub enum InputTarget {
     Ids,
     DraftKey,
     CreateWithId(ContentWriteStatus),
+    MediaPath,
+    MediaFileName,
+    MediaTags,
+    MediaAlt,
+    MediaLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +162,9 @@ pub enum PendingConfirmation {
         member_id: String,
         member_name: String,
     },
+    DeleteMedia {
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +188,19 @@ pub struct App {
     pub members_loading: bool,
     pub member_picker: Option<MemberPicker>,
     pub member_return_screen: Screen,
+    pub media: Vec<MediaInfo>,
+    pub media_total_count: usize,
+    pub media_selected: usize,
+    pub media_loading: bool,
+    pub media_return_screen: Screen,
+    pub media_file_name: Option<String>,
+    pub media_tags: Option<String>,
+    pub media_alt: Option<String>,
+    pub media_image_only: bool,
+    pub media_limit: usize,
+    pub media_page: usize,
+    pub media_pages: Vec<Vec<MediaInfo>>,
+    pub media_page_next_tokens: Vec<Option<String>>,
     pub apis: Vec<ApiInfo>,
     pub api_selected: usize,
     pub endpoint: Option<String>,
@@ -233,7 +255,20 @@ pub enum Action {
     SelectApiAt(usize),
     SelectContentAt(usize),
     SelectMemberAt(usize),
+    SelectMediaAt(usize),
     OpenMembers,
+    OpenMedia,
+    UploadMedia,
+    DeleteMediaRequest,
+    CompleteMediaPath,
+    EditMediaFileName,
+    EditMediaTags,
+    EditMediaAlt,
+    EditMediaLimit,
+    ToggleMediaImageOnly,
+    ClearMediaQuery,
+    NextMediaPage,
+    PrevMediaPage,
     FetchMemberDetail,
     ChangeCreator,
     MemberPickerMoveDown,
@@ -318,6 +353,11 @@ pub enum Command {
     FetchMemberDetail {
         member_id: String,
     },
+    FetchMedia,
+    UploadMedia {
+        path: String,
+    },
+    CompleteMediaPath,
     Create {
         template: Value,
         status: ContentWriteStatus,
@@ -348,6 +388,18 @@ pub enum AppEvent {
     },
     MemberDetailLoaded(MemberInfo),
     MembersFailed(String),
+    MediaLoaded {
+        page: usize,
+        media: Vec<MediaInfo>,
+        total_count: usize,
+        next_token: Option<String>,
+    },
+    MediaMutationSucceeded(String),
+    MediaDeleted {
+        id: String,
+        url: String,
+    },
+    MediaFailed(String),
     ContentsLoaded {
         endpoint: String,
         collection: ContentCollection,
@@ -425,6 +477,19 @@ impl App {
             members_loading: false,
             member_picker: None,
             member_return_screen: Screen::EndpointPicker,
+            media: Vec::new(),
+            media_total_count: 0,
+            media_selected: 0,
+            media_loading: false,
+            media_return_screen: Screen::EndpointPicker,
+            media_file_name: None,
+            media_tags: None,
+            media_alt: None,
+            media_image_only: false,
+            media_limit: 100,
+            media_page: 0,
+            media_pages: Vec::new(),
+            media_page_next_tokens: Vec::new(),
             apis: Vec::new(),
             api_selected: 0,
             endpoint,
@@ -491,6 +556,9 @@ impl App {
                     self.screen = self.member_return_screen;
                     self.member_detail = None;
                     self.message = None;
+                } else if self.screen == Screen::Media {
+                    self.screen = self.media_return_screen;
+                    self.message = None;
                 } else if self.screen == Screen::ContentBrowser {
                     self.help_open = false;
                     self.close_preview();
@@ -524,6 +592,11 @@ impl App {
                         self.member_detail = None;
                     }
                 }
+                Screen::Media => {
+                    if self.media_selected + 1 < self.media.len() {
+                        self.media_selected += 1;
+                    }
+                }
             },
             Action::MoveUp => match self.screen {
                 Screen::EndpointPicker => {
@@ -536,6 +609,9 @@ impl App {
                 Screen::Members => {
                     self.member_selected = self.member_selected.saturating_sub(1);
                     self.member_detail = None;
+                }
+                Screen::Media => {
+                    self.media_selected = self.media_selected.saturating_sub(1);
                 }
             },
             Action::SelectApiAt(index) => {
@@ -558,6 +634,11 @@ impl App {
                     self.member_detail = None;
                 }
             }
+            Action::SelectMediaAt(index) => {
+                if self.screen == Screen::Media && index < self.media.len() {
+                    self.media_selected = index;
+                }
+            }
             Action::OpenMembers => {
                 if self.screen != Screen::Members {
                     self.member_return_screen = self.screen;
@@ -568,6 +649,93 @@ impl App {
                 self.members_loading = true;
                 self.message = Some("Loading members...".into());
                 return Command::FetchMembers;
+            }
+            Action::OpenMedia => {
+                if self.screen != Screen::Media {
+                    self.media_return_screen = self.screen;
+                }
+                self.close_preview();
+                self.screen = Screen::Media;
+                self.media_loading = true;
+                self.reset_media_pagination();
+                self.message = Some("Loading media...".into());
+                return Command::FetchMedia;
+            }
+            Action::UploadMedia => {
+                if self.screen == Screen::Media {
+                    self.begin_input(InputTarget::MediaPath);
+                    self.message = None;
+                }
+            }
+            Action::DeleteMediaRequest => {
+                if self.screen == Screen::Media {
+                    if let Some(media) = self.media.get(self.media_selected) {
+                        self.pending_confirmation = Some(PendingConfirmation::DeleteMedia {
+                            url: media.url.clone(),
+                        });
+                        self.message = Some("Confirm media deletion.".into());
+                    }
+                }
+            }
+            Action::CompleteMediaPath => return Command::CompleteMediaPath,
+            Action::EditMediaFileName => self.begin_input(InputTarget::MediaFileName),
+            Action::EditMediaTags => self.begin_input(InputTarget::MediaTags),
+            Action::EditMediaAlt => self.begin_input(InputTarget::MediaAlt),
+            Action::EditMediaLimit => self.begin_input(InputTarget::MediaLimit),
+            Action::ToggleMediaImageOnly => {
+                if self.screen == Screen::Media {
+                    self.media_image_only = !self.media_image_only;
+                    self.reset_media_pagination();
+                    self.media_loading = true;
+                    self.message = None;
+                    return Command::FetchMedia;
+                }
+            }
+            Action::ClearMediaQuery => {
+                if self.screen == Screen::Media {
+                    self.media_file_name = None;
+                    self.media_tags = None;
+                    self.media_alt = None;
+                    self.media_image_only = false;
+                    self.media_limit = 100;
+                    self.reset_media_pagination();
+                    self.media_loading = true;
+                    self.message = None;
+                    return Command::FetchMedia;
+                }
+            }
+            Action::NextMediaPage => {
+                if self.screen == Screen::Media {
+                    let next_page = self.media_page.saturating_add(1);
+                    if let Some(cached) = self.media_pages.get(next_page).cloned() {
+                        self.media_page = next_page;
+                        self.media = cached;
+                        self.media_selected = 0;
+                    } else if self
+                        .media_page_next_tokens
+                        .get(self.media_page)
+                        .and_then(Option::as_ref)
+                        .is_some()
+                        && (self.media_page + 1) * self.media_limit < self.media_total_count
+                    {
+                        self.media_page = next_page;
+                        self.media_selected = 0;
+                        self.media_loading = true;
+                        self.message = None;
+                        return Command::FetchMedia;
+                    }
+                }
+            }
+            Action::PrevMediaPage => {
+                if self.screen == Screen::Media && self.media_page > 0 {
+                    self.media_page -= 1;
+                    if let Some(cached) = self.media_pages.get(self.media_page).cloned() {
+                        self.media = cached;
+                    }
+                    self.media_selected = 0;
+                    self.media_loading = false;
+                    self.message = None;
+                }
             }
             Action::FetchMemberDetail => {
                 if self.screen == Screen::Members {
@@ -722,6 +890,12 @@ impl App {
                     self.member_detail = None;
                     self.message = Some("Loading members...".into());
                     return Command::FetchMembers;
+                }
+                Screen::Media => {
+                    self.media_loading = true;
+                    self.reset_media_pagination();
+                    self.message = Some("Loading media...".into());
+                    return Command::FetchMedia;
                 }
                 _ => {}
             },
@@ -1156,6 +1330,57 @@ impl App {
                     let input = self.input_buffer.trim().to_string();
                     self.input_buffer.clear();
                     self.input_cursor = 0;
+                    if target == InputTarget::MediaPath {
+                        if input.is_empty() {
+                            self.message = Some("Media file path is required.".into());
+                            return Command::None;
+                        }
+                        self.media_loading = true;
+                        self.message = Some("Uploading media...".into());
+                        return Command::UploadMedia { path: input };
+                    }
+                    if matches!(
+                        target,
+                        InputTarget::MediaFileName
+                            | InputTarget::MediaTags
+                            | InputTarget::MediaAlt
+                            | InputTarget::MediaLimit
+                    ) {
+                        match target {
+                            InputTarget::MediaFileName => {
+                                self.media_file_name = (!input.is_empty()).then_some(input)
+                            }
+                            InputTarget::MediaTags => {
+                                let tags = normalize_comma_separated(&input);
+                                self.media_tags = (!tags.is_empty()).then_some(tags);
+                            }
+                            InputTarget::MediaAlt => {
+                                self.media_alt = (!input.is_empty()).then_some(input)
+                            }
+                            InputTarget::MediaLimit => {
+                                if input.is_empty() {
+                                    self.media_limit = 100;
+                                } else {
+                                    let Ok(limit) = input.parse::<usize>() else {
+                                        self.message =
+                                            Some("Media limit must be 1 through 100.".into());
+                                        return Command::None;
+                                    };
+                                    if !(1..=100).contains(&limit) {
+                                        self.message =
+                                            Some("Media limit must be 1 through 100.".into());
+                                        return Command::None;
+                                    }
+                                    self.media_limit = limit;
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                        self.media_loading = true;
+                        self.reset_media_pagination();
+                        self.message = None;
+                        return Command::FetchMedia;
+                    }
                     if let InputTarget::CreateWithId(status) = target {
                         if self.is_object_api() {
                             self.message =
@@ -1187,6 +1412,11 @@ impl App {
                             self.ids = (!ids.is_empty()).then_some(ids);
                         }
                         InputTarget::DraftKey => self.draft_key = value,
+                        InputTarget::MediaPath => unreachable!(),
+                        InputTarget::MediaFileName
+                        | InputTarget::MediaTags
+                        | InputTarget::MediaAlt
+                        | InputTarget::MediaLimit => unreachable!(),
                         InputTarget::CreateWithId(_) => unreachable!(),
                     }
                     return self.reload_after_query_change();
@@ -1274,6 +1504,65 @@ impl App {
                 if self.screen == Screen::Members || self.member_picker.is_some() {
                     self.members_loading = false;
                     self.message = Some(format!("error: {error}"));
+                    self.show_api_error(error);
+                }
+            }
+            AppEvent::MediaLoaded {
+                page,
+                media,
+                total_count,
+                next_token,
+            } => {
+                if self.screen == Screen::Media && self.media_loading && self.media_page == page {
+                    if self.media_pages.len() <= page {
+                        self.media_pages.resize(page + 1, Vec::new());
+                    }
+                    if self.media_page_next_tokens.len() <= page {
+                        self.media_page_next_tokens.resize(page + 1, None);
+                    }
+                    self.media_pages[page] = media.clone();
+                    self.media_page_next_tokens[page] = next_token;
+                    self.media = media;
+                    self.media_total_count = total_count;
+                    self.media_selected =
+                        self.media_selected.min(self.media.len().saturating_sub(1));
+                    self.media_loading = false;
+                    if self.message.as_deref() == Some("Loading media...") {
+                        self.message = None;
+                    }
+                }
+            }
+            AppEvent::MediaMutationSucceeded(message) => {
+                if self.screen == Screen::Media {
+                    self.pending_confirmation = None;
+                    self.reset_media_pagination();
+                    self.media_loading = true;
+                    self.message = Some(message);
+                    return Command::FetchMedia;
+                }
+            }
+            AppEvent::MediaDeleted { id, url } => {
+                if self.screen == Screen::Media {
+                    self.pending_confirmation = None;
+                    let previous_len = self.media.len();
+                    self.media
+                        .retain(|media| media.id != id && media.url != url);
+                    if let Some(page) = self.media_pages.get_mut(self.media_page) {
+                        page.retain(|media| media.id != id && media.url != url);
+                    }
+                    if self.media.len() < previous_len {
+                        self.media_total_count = self.media_total_count.saturating_sub(1);
+                    }
+                    self.media_selected =
+                        self.media_selected.min(self.media.len().saturating_sub(1));
+                    self.media_loading = false;
+                    self.message = Some("Media deleted.".into());
+                }
+            }
+            AppEvent::MediaFailed(error) => {
+                if self.screen == Screen::Media {
+                    self.media_loading = false;
+                    self.pending_confirmation = None;
                     self.show_api_error(error);
                 }
             }
@@ -1609,11 +1898,22 @@ impl App {
             InputTarget::Orders => self.orders.clone(),
             InputTarget::Ids => self.ids.clone(),
             InputTarget::DraftKey => self.draft_key.clone(),
-            InputTarget::CreateWithId(_) => None,
+            InputTarget::CreateWithId(_) | InputTarget::MediaPath => None,
+            InputTarget::MediaFileName => self.media_file_name.clone(),
+            InputTarget::MediaTags => self.media_tags.clone(),
+            InputTarget::MediaAlt => self.media_alt.clone(),
+            InputTarget::MediaLimit => Some(self.media_limit.to_string()),
         }
         .unwrap_or_default();
         self.input_cursor = self.input_buffer.chars().count();
         self.input_target = Some(target);
+    }
+
+    fn reset_media_pagination(&mut self) {
+        self.media_page = 0;
+        self.media_pages.clear();
+        self.media_page_next_tokens.clear();
+        self.media_selected = 0;
     }
 
     fn reload_after_query_change(&mut self) -> Command {
@@ -1659,6 +1959,10 @@ impl App {
 }
 
 pub fn normalize_ids(value: &str) -> String {
+    normalize_comma_separated(value)
+}
+
+fn normalize_comma_separated(value: &str) -> String {
     value
         .split(',')
         .map(str::trim)
@@ -3864,6 +4168,158 @@ mod tests {
             app.apply_action(Action::ConfirmPending),
             Command::Confirmed(PendingConfirmation::Creator { .. })
         ));
+    }
+
+    #[test]
+    fn media_browser_upload_and_delete_follow_command_flow() {
+        let mut app = App::new(credentials_only_config());
+        assert_eq!(app.apply_action(Action::OpenMedia), Command::FetchMedia);
+        assert_eq!(app.screen, Screen::Media);
+
+        app.apply_event(AppEvent::MediaLoaded {
+            page: 0,
+            media: vec![MediaInfo {
+                id: "media-id".into(),
+                url: "https://images.microcms-assets.io/sample.png".into(),
+                width: Some(100),
+                height: Some(50),
+                alt: None,
+                tags: Vec::new(),
+                created_at: None,
+                updated_at: None,
+            }],
+            total_count: 1,
+            next_token: None,
+        });
+        assert_eq!(app.media.len(), 1);
+        assert!(!app.media_loading);
+
+        assert_eq!(app.apply_action(Action::UploadMedia), Command::None);
+        assert_eq!(app.input_target, Some(InputTarget::MediaPath));
+        app.input_buffer = "/tmp/sample.png".into();
+        app.input_cursor = app.input_buffer.chars().count();
+        assert_eq!(
+            app.apply_action(Action::InputApply),
+            Command::UploadMedia {
+                path: "/tmp/sample.png".into()
+            }
+        );
+
+        assert_eq!(app.apply_action(Action::DeleteMediaRequest), Command::None);
+        assert_eq!(
+            app.pending_confirmation,
+            Some(PendingConfirmation::DeleteMedia {
+                url: "https://images.microcms-assets.io/sample.png".into()
+            })
+        );
+        assert_eq!(
+            app.apply_action(Action::ConfirmPending),
+            Command::Confirmed(PendingConfirmation::DeleteMedia {
+                url: "https://images.microcms-assets.io/sample.png".into()
+            })
+        );
+        assert_eq!(
+            app.apply_event(AppEvent::MediaDeleted {
+                id: "media-id".into(),
+                url: "https://images.microcms-assets.io/sample.png".into(),
+            }),
+            Command::None
+        );
+        assert!(app.media.is_empty());
+        assert_eq!(app.media_total_count, 0);
+        assert!(!app.media_loading);
+        assert_eq!(app.message.as_deref(), Some("Media deleted."));
+    }
+
+    #[test]
+    fn media_filters_use_input_modals_toggle_and_clear() {
+        let mut app = App::new(credentials_only_config());
+        app.screen = Screen::Media;
+
+        app.apply_action(Action::EditMediaFileName);
+        app.input_buffer = " hero ".into();
+        assert_eq!(app.apply_action(Action::InputApply), Command::FetchMedia);
+        assert_eq!(app.media_file_name.as_deref(), Some("hero"));
+
+        app.apply_action(Action::EditMediaTags);
+        app.input_buffer = " news, featured, ".into();
+        assert_eq!(app.apply_action(Action::InputApply), Command::FetchMedia);
+        assert_eq!(app.media_tags.as_deref(), Some("news,featured"));
+
+        app.apply_action(Action::EditMediaAlt);
+        app.input_buffer = " cat ".into();
+        assert_eq!(app.apply_action(Action::InputApply), Command::FetchMedia);
+        assert_eq!(app.media_alt.as_deref(), Some("cat"));
+
+        assert_eq!(
+            app.apply_action(Action::ToggleMediaImageOnly),
+            Command::FetchMedia
+        );
+        assert!(app.media_image_only);
+
+        app.apply_action(Action::EditMediaLimit);
+        app.input_buffer = "25".into();
+        assert_eq!(app.apply_action(Action::InputApply), Command::FetchMedia);
+        assert_eq!(app.media_limit, 25);
+
+        assert_eq!(
+            app.apply_action(Action::ClearMediaQuery),
+            Command::FetchMedia
+        );
+        assert_eq!(app.media_file_name, None);
+        assert_eq!(app.media_tags, None);
+        assert_eq!(app.media_alt, None);
+        assert!(!app.media_image_only);
+        assert_eq!(app.media_limit, 100);
+    }
+
+    #[test]
+    fn media_uses_token_pages_and_cached_previous_pages() {
+        let mut app = App::new(credentials_only_config());
+        app.screen = Screen::Media;
+        app.media_loading = true;
+        app.media_limit = 1;
+        app.apply_event(AppEvent::MediaLoaded {
+            page: 0,
+            media: vec![MediaInfo {
+                id: "first".into(),
+                url: "https://example.com/first.png".into(),
+                width: None,
+                height: None,
+                alt: None,
+                tags: Vec::new(),
+                created_at: None,
+                updated_at: None,
+            }],
+            total_count: 2,
+            next_token: Some("next".into()),
+        });
+
+        assert_eq!(app.apply_action(Action::NextMediaPage), Command::FetchMedia);
+        assert_eq!(app.media_page, 1);
+        app.apply_event(AppEvent::MediaLoaded {
+            page: 1,
+            media: vec![MediaInfo {
+                id: "second".into(),
+                url: "https://example.com/second.png".into(),
+                width: None,
+                height: None,
+                alt: None,
+                tags: Vec::new(),
+                created_at: None,
+                updated_at: None,
+            }],
+            total_count: 2,
+            next_token: None,
+        });
+        assert_eq!(app.media[0].id, "second");
+
+        assert_eq!(app.apply_action(Action::PrevMediaPage), Command::None);
+        assert_eq!(app.media_page, 0);
+        assert_eq!(app.media[0].id, "first");
+        assert_eq!(app.apply_action(Action::NextMediaPage), Command::None);
+        assert_eq!(app.media_page, 1);
+        assert_eq!(app.media[0].id, "second");
     }
 
     #[test]

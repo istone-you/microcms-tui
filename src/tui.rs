@@ -31,7 +31,8 @@ use crate::{
     },
     config::Config,
     microcms::{
-        ContentCollectionKind, ContentQuery, ContentWriteStatus, MicroCmsClient, PublicationStatus,
+        ContentCollectionKind, ContentQuery, ContentWriteStatus, MediaQuery, MicroCmsClient,
+        PublicationStatus,
     },
     ui,
 };
@@ -68,6 +69,9 @@ enum MutationRequest {
     Creator {
         content_id: String,
         member_id: String,
+    },
+    DeleteMedia {
+        url: String,
     },
 }
 
@@ -251,6 +255,7 @@ fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option
         Screen::EndpointPicker => horizontal_columns(main, 60),
         Screen::ContentBrowser => horizontal_columns(main, 40),
         Screen::Members => horizontal_columns(main, 45),
+        Screen::Media => horizontal_columns(main, 45),
     };
     let list_area = columns[0];
     if app.screen == Screen::ContentBrowser && rect_contains(columns[1], mouse.column, mouse.row) {
@@ -271,12 +276,15 @@ fn action_for_mouse(mouse: MouseEvent, app: &App, terminal_area: Rect) -> Option
                 Screen::EndpointPicker => (app.api_selected, app.apis.len()),
                 Screen::ContentBrowser => (app.content_selected, app.items.len()),
                 Screen::Members => (app.member_selected, app.members.len()),
+                Screen::Media => (app.media_selected, app.media.len()),
             };
             list_index_at(list_area, selected, len, mouse.column, mouse.row).map(|index| {
                 if app.screen == Screen::EndpointPicker {
                     Action::SelectApiAt(index)
                 } else if app.screen == Screen::Members {
                     Action::SelectMemberAt(index)
+                } else if app.screen == Screen::Media {
+                    Action::SelectMediaAt(index)
                 } else {
                     Action::SelectContentAt(index)
                 }
@@ -400,6 +408,9 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
         return match code {
             KeyCode::Enter => Some(Action::InputApply),
             KeyCode::Esc => Some(Action::InputCancel),
+            KeyCode::Tab if app.input_target == Some(crate::app::InputTarget::MediaPath) => {
+                Some(Action::CompleteMediaPath)
+            }
             _ => text_edit_action(key)
                 .map(Action::InputEdit)
                 .or_else(|| printable_character(key).map(Action::InputChar)),
@@ -462,6 +473,9 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
     if code == KeyCode::Char('M') {
         return Some(Action::OpenMembers);
     }
+    if code == KeyCode::Char('a') {
+        return Some(Action::OpenMedia);
+    }
     if app.screen == Screen::Members {
         return match code {
             KeyCode::Char('?') => Some(Action::ToggleHelp),
@@ -470,6 +484,26 @@ fn action_for_key(key: KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
             KeyCode::Enter => Some(Action::FetchMemberDetail),
             KeyCode::Char('r') => Some(Action::Reload),
+            _ => None,
+        };
+    }
+    if app.screen == Screen::Media {
+        return match code {
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Esc | KeyCode::Char('b') => Some(Action::Back),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+            KeyCode::Char('r') => Some(Action::Reload),
+            KeyCode::Char('u') => Some(Action::UploadMedia),
+            KeyCode::Char('d') => Some(Action::DeleteMediaRequest),
+            KeyCode::Char('/') => Some(Action::EditMediaFileName),
+            KeyCode::Char('t') => Some(Action::EditMediaTags),
+            KeyCode::Char('A') => Some(Action::EditMediaAlt),
+            KeyCode::Char('I') => Some(Action::ToggleMediaImageOnly),
+            KeyCode::Char('l') => Some(Action::EditMediaLimit),
+            KeyCode::Char('x') => Some(Action::ClearMediaQuery),
+            KeyCode::Char('n') | KeyCode::PageDown => Some(Action::NextMediaPage),
+            KeyCode::Char('p') | KeyCode::PageUp => Some(Action::PrevMediaPage),
             _ => None,
         };
     }
@@ -620,7 +654,10 @@ fn handle_command(
         | Command::FetchVersions { .. }
         | Command::FetchReservation { .. }
         | Command::FetchMembers
-        | Command::FetchMemberDetail { .. }) => schedule_fetch(app, fetch, tx),
+        | Command::FetchMemberDetail { .. }
+        | Command::FetchMedia) => schedule_fetch(app, fetch, tx),
+        Command::UploadMedia { path } => schedule_media_upload(app, path, tx),
+        Command::CompleteMediaPath => complete_media_path(app),
         Command::Create { template, status } => match edit_json(terminal, "create", &template) {
             Ok(EditResult::Changed(value)) => {
                 let value = sanitized_payload(&value);
@@ -698,7 +735,8 @@ fn queue_write_mutation(
                 MutationRequest::Delete { .. }
                 | MutationRequest::Status { .. }
                 | MutationRequest::Reservation { .. }
-                | MutationRequest::Creator { .. } => {
+                | MutationRequest::Creator { .. }
+                | MutationRequest::DeleteMedia { .. } => {
                     unreachable!("only content writes are queued here")
                 }
             });
@@ -794,8 +832,15 @@ fn schedule_confirmed_mutation(
                 member_id,
             }
         }
+        PendingConfirmation::DeleteMedia { url } => {
+            app.message = Some("Deleting media...".into());
+            MutationRequest::DeleteMedia { url }
+        }
     };
-    schedule_mutation(app, mutation, tx);
+    match mutation {
+        MutationRequest::DeleteMedia { url } => schedule_media_delete(app, url, tx),
+        mutation => schedule_mutation(app, mutation, tx),
+    }
 }
 
 fn schema_load_result(schema: Value) -> (Option<Value>, Option<Vec<String>>, Option<String>) {
@@ -830,6 +875,18 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
         draft_key: app.draft_key.clone(),
         rich_editor_format: app.rich_editor_format.clone(),
     };
+    let media_query = MediaQuery {
+        limit: app.media_limit,
+        image_only: app.media_image_only,
+        file_name: app.media_file_name.clone(),
+        tags: app.media_tags.clone(),
+        alt: app.media_alt.clone(),
+    };
+    let media_page = app.media_page;
+    let media_token = media_page
+        .checked_sub(1)
+        .and_then(|previous| app.media_page_next_tokens.get(previous))
+        .and_then(Clone::clone);
     let needs_schema = should_fetch_schema(app, endpoint.as_deref());
     let is_version_fetch = matches!(&command, Command::FetchVersions { .. });
     let is_reservation_fetch = matches!(&command, Command::FetchReservation { .. });
@@ -837,6 +894,7 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
         &command,
         Command::FetchMembers | Command::FetchMemberDetail { .. }
     );
+    let is_media_fetch = matches!(&command, Command::FetchMedia);
     let auxiliary_content_id = match &command {
         Command::FetchVersions { content_id } | Command::FetchReservation { content_id } => {
             content_id.clone()
@@ -975,6 +1033,17 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                         total_count: members.total_count,
                     })
                 }
+                Command::FetchMedia => {
+                    let media = client
+                        .list_media(&media_query, media_token.as_deref())
+                        .await?;
+                    Ok(AppEvent::MediaLoaded {
+                        page: media_page,
+                        media: media.media,
+                        total_count: media.total_count,
+                        next_token: media.token,
+                    })
+                }
                 Command::FetchMemberDetail { member_id } => Ok(AppEvent::MemberDetailLoaded(
                     client.get_member(&member_id).await?,
                 )),
@@ -1035,6 +1104,7 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
                 error: format!("{error:#}"),
             },
             Err(error) if is_member_fetch => AppEvent::MembersFailed(format!("{error:#}")),
+            Err(error) if is_media_fetch => AppEvent::MediaFailed(format!("{error:#}")),
             Err(error) => AppEvent::FetchFailed {
                 endpoint: failure_endpoint,
                 error: format!("{error:#}"),
@@ -1042,6 +1112,99 @@ fn schedule_fetch(app: &App, command: Command, tx: mpsc::UnboundedSender<AppEven
         };
         let _ = tx.send(event);
     });
+}
+
+fn schedule_media_upload(app: &App, path: String, tx: mpsc::UnboundedSender<AppEvent>) {
+    let service_id = app.config.service_id.clone();
+    let api_key = app.config.api_key.clone();
+    tokio::spawn(async move {
+        let result: Result<AppEvent> = async {
+            let client = MicroCmsClient::new(
+                service_id.context("service ID is missing")?,
+                api_key.context("API key is missing")?,
+            )?;
+            let response = client.upload_media(Path::new(&path)).await?;
+            let url = response
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("<URL unavailable>");
+            Ok(AppEvent::MediaMutationSucceeded(format!(
+                "Media uploaded: {url}"
+            )))
+        }
+        .await;
+        let event = result.unwrap_or_else(|error| AppEvent::MediaFailed(format!("{error:#}")));
+        let _ = tx.send(event);
+    });
+}
+
+fn schedule_media_delete(app: &App, url: String, tx: mpsc::UnboundedSender<AppEvent>) {
+    let service_id = app.config.service_id.clone();
+    let api_key = app.config.api_key.clone();
+    tokio::spawn(async move {
+        let result: Result<AppEvent> = async {
+            let client = MicroCmsClient::new(
+                service_id.context("service ID is missing")?,
+                api_key.context("API key is missing")?,
+            )?;
+            let deleted = client.delete_media(&url).await?;
+            Ok(AppEvent::MediaDeleted {
+                id: deleted.id,
+                url,
+            })
+        }
+        .await;
+        let event = result.unwrap_or_else(|error| AppEvent::MediaFailed(format!("{error:#}")));
+        let _ = tx.send(event);
+    });
+}
+
+fn complete_media_path(app: &mut App) {
+    if app.input_target != Some(crate::app::InputTarget::MediaPath) {
+        return;
+    }
+    let input = app.input_buffer.clone();
+    let expanded = if let Some(rest) = input.strip_prefix("~/") {
+        directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(rest))
+            .unwrap_or_else(|| PathBuf::from(&input))
+    } else {
+        PathBuf::from(&input)
+    };
+    let (directory, prefix) = if input.ends_with(std::path::MAIN_SEPARATOR) {
+        (expanded.as_path(), "")
+    } else {
+        (
+            expanded.parent().unwrap_or_else(|| Path::new(".")),
+            expanded
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        )
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        app.message = Some("Path directory does not exist.".into());
+        return;
+    };
+    let mut matches = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|entry| entry.file_name());
+    if matches.len() == 1 {
+        let entry = &matches[0];
+        let mut completed = entry.path().to_string_lossy().to_string();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            completed.push(std::path::MAIN_SEPARATOR);
+        }
+        app.input_buffer = completed;
+        app.input_cursor = app.input_buffer.chars().count();
+        app.message = None;
+    } else if matches.is_empty() {
+        app.message = Some("No path completion match.".into());
+    } else {
+        app.message = Some(format!("{} path matches.", matches.len()));
+    }
 }
 
 fn should_fetch_schema(app: &App, endpoint: Option<&str>) -> bool {
@@ -1198,6 +1361,9 @@ fn schedule_mutation(app: &App, mutation: MutationRequest, tx: mpsc::UnboundedSe
                         endpoint: endpoint.clone(),
                         message: "Content creator changed; page reloaded.".into(),
                     })
+                }
+                MutationRequest::DeleteMedia { .. } => {
+                    unreachable!("media deletion uses schedule_media_delete")
                 }
             }
         }
@@ -1477,6 +1643,83 @@ mod tests {
             action_for_key(key(KeyCode::Char('m')), &app),
             Some(Action::ChangeCreator)
         );
+    }
+
+    #[test]
+    fn media_keys_open_browser_upload_delete_and_complete_paths() {
+        let mut app = App::new(Config::default());
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('a')), &app),
+            Some(Action::OpenMedia)
+        );
+        app.screen = Screen::Media;
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('u')), &app),
+            Some(Action::UploadMedia)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('d')), &app),
+            Some(Action::DeleteMediaRequest)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('/')), &app),
+            Some(Action::EditMediaFileName)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('t')), &app),
+            Some(Action::EditMediaTags)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('A')), &app),
+            Some(Action::EditMediaAlt)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('I')), &app),
+            Some(Action::ToggleMediaImageOnly)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('l')), &app),
+            Some(Action::EditMediaLimit)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('n')), &app),
+            Some(Action::NextMediaPage)
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Char('p')), &app),
+            Some(Action::PrevMediaPage)
+        );
+        app.input_target = Some(crate::app::InputTarget::MediaPath);
+        assert_eq!(
+            action_for_key(key(KeyCode::Tab), &app),
+            Some(Action::CompleteMediaPath)
+        );
+    }
+
+    #[test]
+    fn media_path_completion_completes_a_unique_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "microcms-tui-path-completion-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("sample-image.png");
+        fs::write(&file, b"image").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.input_target = Some(crate::app::InputTarget::MediaPath);
+        app.input_buffer = directory.join("sample-i").to_string_lossy().into();
+        app.input_cursor = app.input_buffer.chars().count();
+        complete_media_path(&mut app);
+
+        assert_eq!(app.input_buffer, file.to_string_lossy());
+        assert_eq!(app.input_cursor, app.input_buffer.chars().count());
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir(directory);
     }
 
     #[test]

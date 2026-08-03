@@ -52,6 +52,7 @@ Content labels use the first non-empty value in Management API `apiFields` order
 - `Ctrl-C`: quit from any screen or mode
 - `?`: open or close the centered in-app keybinding help (except while typing in an input modal)
 - `M`: open the service member list
+- `a`: open the service media browser
 
 Endpoint picker:
 
@@ -120,6 +121,24 @@ Member browser:
 - `b` or `Esc`: return to the previous screen
 
 Member list/detail retrieval uses Management API `GET /api/v1/members` and `GET /api/v1/members/{member_id}`. Changing a creator uses `PATCH /api/v1/contents/{endpoint}/{content_id}/createdBy`, opens the cached member list as a centered selector, and requires confirmation before sending. The API key needs **Get Members (List/Detail)** and **Change Content Creator** Management API permissions respectively.
+
+Media browser:
+
+- `j`/`Down` and `k`/`Up`: move through service media
+- `u`: upload one image or file
+- `d`: delete the selected media after confirmation
+- `/`: filter by partial file name
+- `t`: filter by comma-separated tags (AND condition)
+- `A`: filter by partial alternative text
+- `I`: toggle image-only results
+- `l`: set the Management API page limit (`1` through `100`)
+- `x`: clear all media filters and restore limit `100`
+- `n` or `PageDown`: load the next media page
+- `p` or `PageUp`: return to the previous cached media page
+- `r`: reload the media list
+- `b` or `Esc`: return to the previous screen
+
+The media browser uses token-based pages from Management API `GET /api/v2/media` and shows each selected media response as JSON. The initial request includes the configured `limit`, `imageOnly`, `fileName`, `tags`, and `alt` parameters; next-page requests send only the returned `token`, which carries the initial conditions forward. Previously retrieved pages are cached in memory so `p` can return without reusing an expired token. Upload uses multipart `POST /api/v1/media`; enter a local file path in the centered TUI prompt and press `Tab` to complete a matching file or directory path. Each request uploads one file, and microCMS limits API uploads to 5 MB. Delete uses `DELETE /api/v2/media` with the selected media URL and requires confirmation. Media referenced by content cannot be deleted. The API key needs the Management API **Retrieve Media**, **Media Upload**, and **Delete Media** permissions for these operations.
 
 Uppercase `C`, `U`, and `E` are thin wrappers over the Content API `status=draft` query. `D` is different: it changes publication status through the Management API, while `E` sends a Content API PATCH with `status=draft`.
 

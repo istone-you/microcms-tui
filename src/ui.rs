@@ -59,11 +59,47 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Screen::EndpointPicker => picker_status(app),
         Screen::ContentBrowser => content_status(app),
         Screen::Members => members_status(app),
+        Screen::Media => media_status(app),
     };
     frame.render_widget(
         Paragraph::new(Line::from(status)).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
         area,
     );
+}
+
+fn media_status(app: &App) -> String {
+    let mut state = if app.media_loading {
+        "loading...".to_string()
+    } else {
+        let start = if app.media.is_empty() {
+            0
+        } else {
+            app.media_page * app.media_limit + 1
+        };
+        let end = if app.media.is_empty() {
+            0
+        } else {
+            start + app.media.len() - 1
+        };
+        format!("{} total | showing {start}-{end}", app.media_total_count)
+    };
+    let mut query = Vec::new();
+    if let Some(file_name) = &app.media_file_name {
+        query.push(format!("fileName:{}", truncate_inline(file_name, 16)));
+    }
+    if app.media_tags.is_some() {
+        query.push("tags:*".into());
+    }
+    if let Some(alt) = &app.media_alt {
+        query.push(format!("alt:{}", truncate_inline(alt, 16)));
+    }
+    if app.media_image_only {
+        query.push("imageOnly".into());
+    }
+    query.push(format!("limit:{}", app.media_limit));
+    state.push_str(" | ");
+    state.push_str(&query.join(" "));
+    format!(" microcms-tui | Media | {state}")
 }
 
 fn members_status(app: &App) -> String {
@@ -204,7 +240,50 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         Screen::EndpointPicker => draw_endpoint_picker(frame, app, area),
         Screen::ContentBrowser => draw_content_browser(frame, app, area),
         Screen::Members => draw_members(frame, app, area),
+        Screen::Media => draw_media(frame, app, area),
     }
+}
+
+fn draw_media(frame: &mut Frame, app: &App, area: Rect) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+    let items = app
+        .media
+        .iter()
+        .map(|media| {
+            let name = media.url.rsplit('/').next().unwrap_or(media.url.as_str());
+            let dimensions = match (media.width, media.height) {
+                (Some(width), Some(height)) => format!(" ({width}x{height})"),
+                _ => String::new(),
+            };
+            ListItem::new(format!("{name}{dimensions}"))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Media"))
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let selected = (!app.media.is_empty()).then_some(app.media_selected);
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(list, columns[0], &mut state);
+
+    let detail = app
+        .media
+        .get(app.media_selected)
+        .and_then(|media| serde_json::to_string_pretty(media).ok())
+        .unwrap_or_else(|| "No media selected.".into());
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(Block::default().borders(Borders::ALL).title("Media JSON"))
+            .wrap(Wrap { trim: false }),
+        columns[1],
+    );
 }
 
 fn draw_members(frame: &mut Frame, app: &App, area: Rect) {
@@ -481,7 +560,11 @@ fn footer_text(app: &App) -> &'static str {
     if app.api_error.is_some() {
         " j/k scroll | Enter/Esc close"
     } else if app.input_target.is_some() {
-        " Enter apply | Esc cancel"
+        if app.input_target == Some(InputTarget::MediaPath) {
+            " Tab complete | Enter upload | Esc cancel"
+        } else {
+            " Enter apply | Esc cancel"
+        }
     } else if matches!(app.query_selector, Some(QuerySelector::Fields { .. })) {
         " j/k move | Space toggle | Enter apply | Esc cancel"
     } else if app.query_selector.is_some() {
@@ -500,6 +583,7 @@ fn footer_text(app: &App) -> &'static str {
         match app.screen {
             Screen::EndpointPicker => " Enter select | ? help",
             Screen::Members => " Enter detail | r reload | b/Esc back | ? help",
+            Screen::Media => " n/p page | u upload | d delete | b/Esc back | ? help",
             Screen::ContentBrowser if app.content_kind == ContentCollectionKind::Object => {
                 " j/k scroll | g/G top/bottom | r reload | b/Esc back | ? help"
             }
@@ -568,6 +652,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("Object API (GET-only)"),
             Line::from("  ? open/close help"),
             Line::from("  M members"),
+            Line::from("  a media"),
             Line::from(""),
             Line::from("JSON preview"),
             Line::from("  j/k, Up/Down scroll        g/G top/bottom"),
@@ -581,8 +666,20 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
     } else if app.screen == Screen::Members {
         Text::from(vec![
             Line::from("Members"),
+            Line::from("  a media"),
             Line::from("  j/k, Up/Down move"),
             Line::from("  Enter fetch detail          r reload"),
+            Line::from("  b, Esc back                 ? open/close help"),
+        ])
+    } else if app.screen == Screen::Media {
+        Text::from(vec![
+            Line::from("Media"),
+            Line::from("  j/k, Up/Down move"),
+            Line::from("  u upload file (Tab completes paths)"),
+            Line::from("  d delete selected media     r reload"),
+            Line::from("  n/p, PgDn/PgUp next/previous page"),
+            Line::from("  / fileName   t tags   A alt   I imageOnly"),
+            Line::from("  l limit (1-100)             x clear filters"),
             Line::from("  b, Esc back                 ? open/close help"),
         ])
     } else {
@@ -590,6 +687,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App) {
             Line::from("Global"),
             Line::from("  ? open/close help"),
             Line::from("  M members"),
+            Line::from("  a media"),
             Line::from(""),
             Line::from("Navigation"),
             Line::from("  j/k, Up/Down move list      Enter preview/select endpoint"),
@@ -685,6 +783,11 @@ fn draw_input_modal(frame: &mut Frame, app: &App) {
         InputTarget::Ids => "IDs",
         InputTarget::DraftKey => "Draft key",
         InputTarget::CreateWithId(_) => "Content ID",
+        InputTarget::MediaPath => "Media file path",
+        InputTarget::MediaFileName => "Media file name",
+        InputTarget::MediaTags => "Media tags (comma-separated AND)",
+        InputTarget::MediaAlt => "Media alt text",
+        InputTarget::MediaLimit => "Media limit (1-100)",
     };
     let area = centered_modal(frame.area(), 70, 3);
     let inner_width = area.width.saturating_sub(2) as usize;
@@ -1052,6 +1155,11 @@ fn confirmation_text(
             ),
             "The creator metadata for this content will be changed.",
         ),
+        PendingConfirmation::DeleteMedia { url } => (
+            "Confirm delete media",
+            format!("Delete media: {}?", truncate_inline(url, 48)),
+            "Referenced media cannot be deleted.",
+        ),
         PendingConfirmation::PublicationStatus {
             content_ids,
             status: crate::microcms::PublicationStatus::Draft,
@@ -1228,6 +1336,52 @@ mod tests {
             footer_text(&app),
             " j/k move | Space toggle | Enter apply | Esc cancel"
         );
+
+        app.query_selector = None;
+        app.screen = Screen::Media;
+        assert_eq!(
+            footer_text(&app),
+            " n/p page | u upload | d delete | b/Esc back | ? help"
+        );
+        app.input_target = Some(InputTarget::MediaPath);
+        assert_eq!(
+            footer_text(&app),
+            " Tab complete | Enter upload | Esc cancel"
+        );
+    }
+
+    #[test]
+    fn media_screen_shows_list_and_selected_json() {
+        let mut app = App::new(crate::config::Config::default());
+        app.screen = Screen::Media;
+        app.state = LoadState::ContentsLoaded;
+        app.media = vec![crate::microcms::MediaInfo {
+            id: "media-id".into(),
+            url: "https://images.microcms-assets.io/sample.png".into(),
+            width: Some(1200),
+            height: Some(800),
+            alt: Some("sample".into()),
+            tags: vec!["tag".into()],
+            created_at: None,
+            updated_at: None,
+        }];
+        app.media_total_count = 1;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("sample.png"));
+        assert!(rendered.contains("1200x800"));
+        assert!(rendered.contains("Media JSON"));
+        assert!(rendered.contains("media-id"));
     }
 
     #[test]
