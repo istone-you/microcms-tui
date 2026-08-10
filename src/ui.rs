@@ -1054,6 +1054,45 @@ fn draw_confirmation_modal(frame: &mut Frame, app: &App) {
         return;
     };
     let (title, prompt, warning) = confirmation_text(app, confirmation);
+
+    if let Some(value) = confirmation_create_value(confirmation) {
+        let height = frame.area().height.saturating_sub(4).clamp(9, 26);
+        let area = centered_modal_with_max_width(frame.area(), 78, height, 100);
+        let block = Block::default()
+            .style(modal_style())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(title);
+        let inner = block.inner(area);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(1)])
+            .split(inner);
+        let json = serde_json::to_string_pretty(value)
+            .unwrap_or_else(|_| "<failed to format content>".to_string());
+
+        clear_modal_background(frame, area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(prompt),
+                Line::from(warning),
+                Line::from(""),
+                Line::from("y confirm | n/Esc cancel"),
+            ]))
+            .style(modal_style()),
+            sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(json)
+                .style(modal_style())
+                .block(Block::default().borders(Borders::ALL).title("Content"))
+                .wrap(Wrap { trim: false }),
+            sections[1],
+        );
+        return;
+    }
+
     let area = centered_modal_with_max_width(frame.area(), 60, 7, 72);
     let confirmation = Text::from(vec![
         Line::from(prompt),
@@ -1076,6 +1115,14 @@ fn draw_confirmation_modal(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn confirmation_create_value(confirmation: &PendingConfirmation) -> Option<&serde_json::Value> {
+    match confirmation {
+        PendingConfirmation::Create { value, .. }
+        | PendingConfirmation::PutCreate { value, .. } => Some(value),
+        _ => None,
+    }
 }
 
 fn confirmation_text(
@@ -1648,5 +1695,29 @@ mod tests {
             .1,
             "Remove the current publication reservation?"
         );
+    }
+
+    #[test]
+    fn create_confirmation_displays_the_content_payload() {
+        let mut app = App::new(crate::config::Config::default());
+        app.pending_confirmation = Some(PendingConfirmation::Create {
+            value: serde_json::json!({"title": "Example", "published": true}),
+            status: crate::microcms::ContentWriteStatus::Default,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Create and publish content?"));
+        assert!(rendered.contains("\"title\": \"Example\""));
+        assert!(rendered.contains("\"published\": true"));
     }
 }
